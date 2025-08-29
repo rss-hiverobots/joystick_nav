@@ -1,0 +1,11 @@
+twist_mux:
+  ros__parameters:
+    topics:
+      nav:
+        topic: /cmd_vel_nav
+        timeout: 0.5
+        priority: 20
+      joy:
+        topic: /cmd_vel_joy_safe
+        timeout: 0.5
+        priority: 50
