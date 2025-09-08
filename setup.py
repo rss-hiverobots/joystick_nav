@@ -22,6 +22,7 @@ setup(
         'console_scripts': [
             'costmap_joystick = joystick_nav.costmap_joystick:main',
             'room_navigator = joystick_nav.room_navigator:main',
+            'exploration = joystick_nav.exploration:main',
         ],
     },
 )
