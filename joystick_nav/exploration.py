@@ -11,14 +11,26 @@ import random
 import math
 import networkx as nx
 
+from rclpy.action import ActionClient
+from nav2_msgs.action import NavigateToPose
+import tf2_ros
+from geometry_msgs.msg import PoseStamped, Quaternion
+
+def make_quaternion_from_yaw(yaw):
+    """Creates a geometry_msgs/Quaternion from a yaw angle in radians."""
+    import math
+    q = Quaternion()
+    q.w = math.cos(yaw / 2.0)
+    q.x = 0.0
+    q.y = 0.0
+    q.z = math.sin(yaw / 2.0)
+    return q
+
 class PRMExplorer(Node):
     def __init__(self):
         super().__init__('prm_explorer')
 
         self.N = 100
-        self.resample_interval = 20.0  # seconds
-        self.last_resample_time = self.get_clock().now().seconds_nanoseconds()[0]
-
         self.map = None
         self.map_resolution = None
         self.map_origin = None
@@ -28,12 +40,21 @@ class PRMExplorer(Node):
         self.prm_nodes = []
         self.prm_edges = []
         self.selected_node_idx = None
+        self.navigation_active = False
+        self.goal_sent = False
 
-        self.create_subscription(OccupancyGrid, '/global_costmap/costmap', self.map_callback, 1)
+        self.create_subscription(
+            OccupancyGrid, '/global_costmap/costmap', self.map_callback, 1)
         self.markers_pub = self.create_publisher(MarkerArray, '/prm_markers', 1)
         self.edges_pub = self.create_publisher(MarkerArray, '/prm_edges', 1)
-
         self.timer = self.create_timer(1.0, self.main_loop)
+
+        # Nav2 & TF
+        self.nav_to_pose_client = ActionClient(self, NavigateToPose, '/navigate_to_pose')
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+
+        self.initialized = False  # Flag to start first sampling
 
     def map_callback(self, msg: OccupancyGrid):
         self.map = np.array(msg.data, dtype=np.int8).reshape((msg.info.height, msg.info.width))
@@ -41,22 +62,96 @@ class PRMExplorer(Node):
         self.map_origin = (msg.info.origin.position.x, msg.info.origin.position.y)
         self.map_width = msg.info.width
         self.map_height = msg.info.height
+        self.get_logger().info("Received updated costmap.")
+        # Trigger initialization if this is the first map received
+        if not self.initialized:
+            self.initialized = True
+            self.start_new_exploration()
 
     def main_loop(self):
-        now = self.get_clock().now().seconds_nanoseconds()[0]
-        if self.map is None:
+        # Main loop only handles navigation status
+        if not self.initialized or self.map is None:
             return
 
-        if now - self.last_resample_time >= self.resample_interval:
-            self.sample_nodes()
-            self.build_prm()
-            self.select_best_node()
-            self.publish_markers()
-            self.last_resample_time = now
+        if self.navigation_active and hasattr(self, 'nav_future'):
+            # Wait for navigation to finish
+            pass
+        elif not self.navigation_active and self.goal_sent:
+            # After reaching/canceling a goal, sample/build/select again
+            self.start_new_exploration()
+            self.goal_sent = False
+
+    def start_new_exploration(self):
+        """Sample, build PRM, select node, and navigate."""
+        self.sample_nodes()
+        self.build_prm()
+        self.select_best_node()
+        self.publish_markers()
+        if self.selected_node_idx is not None:
+            wx, wy = self.prm_nodes[self.selected_node_idx]
+            self.navigation_active = True
+            self.goal_sent = True
+            future = self.send_nav_goal(wx, wy)
+            if future is not None:
+                self.nav_future = future
+            else:
+                self.navigation_active = False
+                self.goal_sent = False
+                self.get_logger().warn("Failed to send goal. Skipping navigation.")
+
+    def nav_done_cb(self, future):
+        # ... (same as before)
+        try:
+            result = future.result().result
+            code = future.result().status
+            self.get_logger().info(f"Navigation completed with result: {result} (status code: {code})")
+        except Exception as e:
+            self.get_logger().warn(f"Error in navigation callback: {e}")
+        self.navigation_active = False
+        self.selected_node_idx = None
+        # No need to trigger exploration here; main_loop will handle
+
+    def send_nav_goal(self, wx, wy):
+        """
+        Sends a goal to Nav2 and sets up callbacks for acceptance/result.
+        """
+        if not self.nav_to_pose_client.wait_for_server(timeout_sec=2.0):
+            self.get_logger().warn("Nav2 action server not available!")
+            return None
+
+        goal_msg = NavigateToPose.Goal()
+        goal_msg.pose.header.frame_id = "map"
+        goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
+        goal_msg.pose.pose.position.x = wx
+        goal_msg.pose.pose.position.y = wy
+        goal_msg.pose.pose.position.z = 0.0
+        goal_msg.pose.pose.orientation = make_quaternion_from_yaw(0.0)
+        self.get_logger().info(f"Sending goal to Nav2: ({wx:.2f}, {wy:.2f}) in frame map")
+        send_future = self.nav_to_pose_client.send_goal_async(goal_msg)
+        send_future.add_done_callback(self.goal_response_cb)
+        return send_future
+
+    def goal_response_cb(self, future):
+        """
+        Called when Nav2 responds to the goal (accept/reject).
+        """
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self.get_logger().warn('Goal rejected by Nav2!')
+            self.navigation_active = False
+            return
+        self.get_logger().info('Goal accepted by Nav2!')
+        self.result_future = goal_handle.get_result_async()
+        self.result_future.add_done_callback(self.nav_done_cb)
+
 
     def sample_nodes(self):
+        """
+        Samples N free nodes from the map.
+        """
         self.prm_nodes = []
         free_indices = np.argwhere(self.map == 0)
+        self.get_logger().info(f"Found {len(free_indices)} free indices for sampling.")
         if len(free_indices) == 0:
             self.get_logger().warn('No free space in map!')
             return
@@ -67,9 +162,13 @@ class PRMExplorer(Node):
             wx = self.map_origin[0] + x * self.map_resolution
             wy = self.map_origin[1] + y * self.map_resolution
             self.prm_nodes.append((wx, wy))
+        self.get_logger().info(f"Sampled {len(self.prm_nodes)} PRM nodes.")
 
     def build_prm(self):
-        # Create PRM graph
+        """
+        Builds the PRM graph by connecting nodes that are mutually reachable.
+        """
+        self.get_logger().info("Building PRM graph...")
         self.prm_graph = nx.Graph()
         for i, node in enumerate(self.prm_nodes):
             self.prm_graph.add_node(i, pos=node)
@@ -81,13 +180,16 @@ class PRMExplorer(Node):
             for j, n2 in enumerate(self.prm_nodes):
                 if i >= j:
                     continue
-                dist = math.hypot(n1[0]-n2[0], n1[1]-n2[1])
+                dist = math.hypot(n1[0] - n2[0], n1[1] - n2[1])
                 if dist < R and self.is_path_free(n1, n2):
                     self.prm_graph.add_edge(i, j)
                     self.prm_edges.append((i, j))
+        self.get_logger().info(f"Built PRM with {self.prm_graph.number_of_nodes()} nodes and {self.prm_graph.number_of_edges()} edges.")
 
     def is_path_free(self, n1, n2):
-        # Bresenham's line for collision checking
+        """
+        Returns True if the straight line between n1 and n2 does not collide with obstacles.
+        """
         x0 = int((n1[0] - self.map_origin[0]) / self.map_resolution)
         y0 = int((n1[1] - self.map_origin[1]) / self.map_resolution)
         x1 = int((n2[0] - self.map_origin[0]) / self.map_resolution)
@@ -100,7 +202,9 @@ class PRMExplorer(Node):
         return True
 
     def bresenham(self, x0, y0, x1, y1):
-        # Bresenham's line algorithm
+        """
+        Bresenham's line algorithm for grid traversal.
+        """
         points = []
         dx = abs(x1 - x0)
         dy = -abs(y1 - y0)
@@ -141,12 +245,14 @@ class PRMExplorer(Node):
         """
         if self.prm_graph.number_of_nodes() == 0:
             self.selected_node_idx = None
+            self.get_logger().warn("No PRM nodes to select from.")
             return
 
         # Find the largest connected component in the PRM
         components = list(nx.connected_components(self.prm_graph))
         if not components:
             self.selected_node_idx = None
+            self.get_logger().warn("No connected components in PRM.")
             return
         main_component = max(components, key=len)
         node_idxs = list(main_component)
@@ -168,14 +274,22 @@ class PRMExplorer(Node):
             info_gain = np.count_nonzero(local_map == -1)
             connectivity = self.prm_graph.degree[i]
             score = info_gain + connectivity_weight * connectivity
+            self.get_logger().debug(f"Node {i}: info_gain={info_gain}, connectivity={connectivity}, score={score}")
             if score > best_score:
                 best_score = score
                 best_idx = i
         self.selected_node_idx = best_idx
-
+        if best_idx is not None:
+            self.get_logger().info(f"Selected node idx: {best_idx} with score {best_score}.")
+        else:
+            self.get_logger().warn("No node selected after gain calculation.")
 
     def publish_markers(self):
+        """
+        Publishes MarkerArrays for PRM nodes and edges to RViz.
+        """
         if not self.prm_nodes:
+            self.get_logger().debug("No PRM nodes to publish as markers.")
             return
 
         marker_array = MarkerArray()
