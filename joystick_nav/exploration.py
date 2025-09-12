@@ -4,21 +4,17 @@ from rclpy.node import Node
 
 from nav_msgs.msg import OccupancyGrid
 from visualization_msgs.msg import Marker, MarkerArray
-from geometry_msgs.msg import Point
+from geometry_msgs.msg import Point, PoseStamped, Quaternion
 
 import numpy as np
-import random
 import math
 import networkx as nx
 
 from rclpy.action import ActionClient
 from nav2_msgs.action import NavigateToPose
-import tf2_ros
-from geometry_msgs.msg import PoseStamped, Quaternion
 
 def make_quaternion_from_yaw(yaw):
     """Creates a geometry_msgs/Quaternion from a yaw angle in radians."""
-    import math
     q = Quaternion()
     q.w = math.cos(yaw / 2.0)
     q.x = 0.0
@@ -43,18 +39,19 @@ class PRMExplorer(Node):
         self.navigation_active = False
         self.goal_sent = False
 
-        self.create_subscription(
-            OccupancyGrid, '/global_costmap/costmap', self.map_callback, 1)
+        # Robot pose will be read from /aft_mapped_to_init
+        self.robot_pose = None
+        self.create_subscription(PoseStamped, '/aft_mapped_to_init', self.robot_pose_callback, 10)
+        self.create_subscription(OccupancyGrid, '/global_costmap/costmap', self.map_callback, 1)
         self.markers_pub = self.create_publisher(MarkerArray, '/prm_markers', 1)
         self.edges_pub = self.create_publisher(MarkerArray, '/prm_edges', 1)
         self.timer = self.create_timer(1.0, self.main_loop)
 
-        # Nav2 & TF
         self.nav_to_pose_client = ActionClient(self, NavigateToPose, '/navigate_to_pose')
-        self.tf_buffer = tf2_ros.Buffer()
-        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
-
         self.initialized = False  # Flag to start first sampling
+
+    def robot_pose_callback(self, msg: PoseStamped):
+        self.robot_pose = msg
 
     def map_callback(self, msg: OccupancyGrid):
         self.map = np.array(msg.data, dtype=np.int8).reshape((msg.info.height, msg.info.width))
@@ -62,7 +59,7 @@ class PRMExplorer(Node):
         self.map_origin = (msg.info.origin.position.x, msg.info.origin.position.y)
         self.map_width = msg.info.width
         self.map_height = msg.info.height
-        self.get_logger().info("Received updated costmap.")
+        # self.get_logger().info("Received updated costmap.")
         # Trigger initialization if this is the first map received
         if not self.initialized:
             self.initialized = True
@@ -100,7 +97,6 @@ class PRMExplorer(Node):
                 self.get_logger().warn("Failed to send goal. Skipping navigation.")
 
     def nav_done_cb(self, future):
-        # ... (same as before)
         try:
             result = future.result().result
             code = future.result().status
@@ -109,7 +105,6 @@ class PRMExplorer(Node):
             self.get_logger().warn(f"Error in navigation callback: {e}")
         self.navigation_active = False
         self.selected_node_idx = None
-        # No need to trigger exploration here; main_loop will handle
 
     def send_nav_goal(self, wx, wy):
         """
@@ -143,7 +138,6 @@ class PRMExplorer(Node):
         self.get_logger().info('Goal accepted by Nav2!')
         self.result_future = goal_handle.get_result_async()
         self.result_future.add_done_callback(self.nav_done_cb)
-
 
     def sample_nodes(self):
         """
