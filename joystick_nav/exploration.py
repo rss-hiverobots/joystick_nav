@@ -158,16 +158,29 @@ class PRMExplorer(Node):
             self.prm_nodes.append((wx, wy))
         self.get_logger().info(f"Sampled {len(self.prm_nodes)} PRM nodes.")
 
+        # Try to add robot position as a node
+        self.robot_node_idx = None
+        if self.robot_pose is not None:
+            rx = self.robot_pose.pose.position.x
+            ry = self.robot_pose.pose.position.y
+            mx = int((rx - self.map_origin[0]) / self.map_resolution)
+            my = int((ry - self.map_origin[1]) / self.map_resolution)
+            if 0 <= mx < self.map_width and 0 <= my < self.map_height and self.map[my, mx] == 0:
+                self.prm_nodes.append((rx, ry))
+                self.robot_node_idx = len(self.prm_nodes) - 1  # index of robot node
+                self.get_logger().info(f"Added robot node at ({rx:.2f}, {ry:.2f}) as node {self.robot_node_idx}")
+            else:
+                self.get_logger().warn("Robot pose not in free space, not added as a node.")
+
     def build_prm(self):
         """
-        Builds the PRM graph by connecting nodes that are mutually reachable.
+        Builds the PRM graph, including the robot node if available.
         """
         self.get_logger().info("Building PRM graph...")
         self.prm_graph = nx.Graph()
         for i, node in enumerate(self.prm_nodes):
             self.prm_graph.add_node(i, pos=node)
 
-        # Connect nodes within a radius (R)
         R = 3.0  # meters
         self.prm_edges = []
         for i, n1 in enumerate(self.prm_nodes):
@@ -179,7 +192,7 @@ class PRMExplorer(Node):
                     self.prm_graph.add_edge(i, j)
                     self.prm_edges.append((i, j))
         self.get_logger().info(f"Built PRM with {self.prm_graph.number_of_nodes()} nodes and {self.prm_graph.number_of_edges()} edges.")
-
+        
     def is_path_free(self, n1, n2):
         """
         Returns True if the straight line between n1 and n2 does not collide with obstacles.
@@ -218,45 +231,41 @@ class PRMExplorer(Node):
                 y0 += sy
         return points
 
-    def select_best_node(self, radius_m=0.5, connectivity_weight=3.0):
+    def select_best_node(self, radius_m=0.5, connectivity_weight=3.0, distance_weight=0.2):
         """
-        Selects the best node for exploration from the PRM.
-
         The gain for each node is computed as:
-            gain = info_gain + connectivity_weight * connectivity
 
-        - info_gain: Number of unknown (-1) cells in a radius around the node.
-        - connectivity: Number of edges (neighbors) this node has in the PRM graph.
-        - Only nodes in the largest connected PRM component are considered.
-        - Disconnected nodes are ignored.
+            gain = info_gain + connectivity_weight * connectivity - distance_weight * path_length
 
-        Args:
-            radius_m (float): Radius (in meters) to consider for info_gain around each node.
-            connectivity_weight (float): Weight multiplier for the node's connectivity in the gain formula.
-
-        Sets:
-            self.selected_node_idx (int): Index of the selected node in self.prm_nodes.
+        where:
+            - info_gain: Number of unknown (-1) cells within a radius around the node.
+            - connectivity: Number of edges (neighbors) the node has in the PRM graph.
+            - path_length: Shortest path length (in hops) from the robot node to this node.
+            - connectivity_weight: Weight parameter for the connectivity term.
+            - distance_weight: Weight parameter for the path length term.
         """
-        if self.prm_graph.number_of_nodes() == 0:
+        if self.prm_graph.number_of_nodes() == 0 or self.robot_node_idx is None:
             self.selected_node_idx = None
-            self.get_logger().warn("No PRM nodes to select from.")
+            self.get_logger().warn("No PRM nodes or robot node to select from.")
             return
 
-        # Find the largest connected component in the PRM
-        components = list(nx.connected_components(self.prm_graph))
-        if not components:
+        # Find nodes connected to the robot node
+        try:
+            connected_idxs = list(nx.node_connected_component(self.prm_graph, self.robot_node_idx))
+        except Exception:
             self.selected_node_idx = None
-            self.get_logger().warn("No connected components in PRM.")
+            self.get_logger().warn("Robot node is not connected to any PRM nodes.")
             return
-        main_component = max(components, key=len)
-        node_idxs = list(main_component)
 
         # Parameters
         radius = int(radius_m / self.map_resolution)
         best_score = -np.inf
         best_idx = None
 
-        for i in node_idxs:
+        # Do not select the robot node itself!
+        for i in connected_idxs:
+            if i == self.robot_node_idx:
+                continue
             wx, wy = self.prm_nodes[i]
             x = int((wx - self.map_origin[0]) / self.map_resolution)
             y = int((wy - self.map_origin[1]) / self.map_resolution)
@@ -267,8 +276,15 @@ class PRMExplorer(Node):
             local_map = self.map[y0:y1, x0:x1]
             info_gain = np.count_nonzero(local_map == -1)
             connectivity = self.prm_graph.degree[i]
-            score = info_gain + connectivity_weight * connectivity
-            self.get_logger().debug(f"Node {i}: info_gain={info_gain}, connectivity={connectivity}, score={score}")
+
+            # Optionally: subtract path cost from robot
+            try:
+                path_length = nx.shortest_path_length(self.prm_graph, source=self.robot_node_idx, target=i, weight=None)
+            except nx.NetworkXNoPath:
+                path_length = float('inf')
+            # Add this to score if you want to bias shorter paths:
+            score = info_gain + connectivity_weight * connectivity - distance_weight * path_length
+
             if score > best_score:
                 best_score = score
                 best_idx = i
