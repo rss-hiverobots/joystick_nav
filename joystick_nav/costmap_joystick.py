@@ -1,6 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""
+Collision-avoidance command mux that supports forward, lateral, and backward motion.
+- Considers the commanded body-frame (vx, vy) direction to scan a rectangular
+  corridor aligned with the intended motion in the map frame.
+- Scales linear speed (both x and y) by free clearance along that direction.
+- Steers away from higher obstacle density (angular.z for diff drive).
+
+ROS 2 Humble, Python.
+"""
+
 import math
 from typing import Optional, Tuple
 
@@ -15,15 +25,21 @@ import tf2_ros
 from geometry_msgs.msg import TransformStamped
 
 
+# --------- small math helpers ---------
+
 def yaw_from_quat_xyzw(x: float, y: float, z: float, w: float) -> float:
-    """
-    Minimal, dependency-free quaternion->yaw.
-    Assumes ROS quaternion ordering (x,y,z,w).
-    """
-    # yaw (z-axis rotation)
+    """Minimal quaternion->yaw (ROS ordering x,y,z,w)."""
     s = 2.0 * (w * z + x * y)
     c = 1.0 - 2.0 * (y * y + z * z)
     return math.atan2(s, c)
+
+
+def wrap_to_pi(a: float) -> float:
+    while a > math.pi:
+        a -= 2.0 * math.pi
+    while a < -math.pi:
+        a += 2.0 * math.pi
+    return a
 
 
 def compose_map_pose_from_odom(
@@ -43,13 +59,7 @@ def compose_map_pose_from_odom(
     return mx, my, myaw
 
 
-def wrap_to_pi(a: float) -> float:
-    while a > math.pi:
-        a -= 2.0 * math.pi
-    while a < -math.pi:
-        a += 2.0 * math.pi
-    return a
-
+# --------------- Node -----------------
 
 class CollisionAvoid(Node):
     def __init__(self):
@@ -68,6 +78,10 @@ class CollisionAvoid(Node):
         self.declare_parameter('slowdown_margin', 0.4)       # [m]
         self.declare_parameter('map_frame', 'map')
         self.declare_parameter('odom_frame', 'odom')
+        # Lateral avoidance (for holonomic robots): how much to tweak vy
+        self.declare_parameter('lateral_avoid_gain', 0.6)    # fraction of max_angular_speed mapped to vy tweak
+        # When rotating in place with small |v|, radius around robot to check
+        self.declare_parameter('rot_safety_radius', 0.35)    # [m]
 
         # Resolve parameters
         self.costmap_topic = self.get_parameter('costmap_topic').value
@@ -82,13 +96,15 @@ class CollisionAvoid(Node):
         self.slowdown_margin = float(self.get_parameter('slowdown_margin').value)
         self.map_frame = self.get_parameter('map_frame').value
         self.odom_frame = self.get_parameter('odom_frame').value
+        self.lateral_avoid_gain = float(self.get_parameter('lateral_avoid_gain').value)
+        self.rot_safety_radius = float(self.get_parameter('rot_safety_radius').value)
 
         # State
         self.latest_costmap: Optional[OccupancyGrid] = None
         self.latest_odom: Optional[Odometry] = None
         self.latest_cmd_in: Optional[Twist] = None
 
-        # TF buffer/listener (no external deps)
+        # TF buffer/listener
         self.tf_buffer = tf2_ros.Buffer()  # default cache time
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
@@ -115,7 +131,7 @@ class CollisionAvoid(Node):
         # 20 Hz control loop
         self.timer = self.create_timer(0.05, self.control_step)
 
-        self.get_logger().info('collision_avoid_cmd_mux node ready (no tf_transformations needed).')
+        self.get_logger().info('collision_avoid_cmd_mux (holonomic) ready.')
 
     # ---- Callbacks ----
     def on_costmap(self, msg: OccupancyGrid):
@@ -129,56 +145,122 @@ class CollisionAvoid(Node):
 
     # ---- Core logic ----
     def control_step(self):
-        if self.latest_cmd_in is None:
+        cmd_in = self.latest_cmd_in
+        if cmd_in is None:
             return
         if self.latest_costmap is None or self.latest_odom is None:
-            self.pub_cmd.publish(self.latest_cmd_in)
+            self.pub_cmd.publish(cmd_in)
             return
 
         pose_map = self.get_robot_pose_in_map()
         if pose_map is None:
-            self.pub_cmd.publish(self.latest_cmd_in)
+            self.pub_cmd.publish(cmd_in)
             return
 
         rx, ry, r_yaw = pose_map
 
-        min_clearance, left_density, right_density = self.scan_corridor(rx, ry, r_yaw)
+        # Body-frame commanded linear velocity
+        vx_b = float(cmd_in.linear.x)
+        vy_b = float(cmd_in.linear.y)
+        v_mag = math.hypot(vx_b, vy_b)
 
         cmd_out = Twist()
-        cmd_out.linear.x = self.latest_cmd_in.linear.x
-        cmd_out.angular.z = self.latest_cmd_in.angular.z
+        cmd_out.linear.x = vx_b
+        cmd_out.linear.y = vy_b
+        cmd_out.angular.z = cmd_in.angular.z
 
-        if min_clearance is None:
-            cmd_out.linear.x = min(cmd_out.linear.x, 0.4)
+        # If essentially rotation-only, do a simple radial safety check and pass through
+        if v_mag < 1e-3:
+            if self.is_obstacle_within_radius(rx, ry, r_yaw, self.rot_safety_radius):
+                # discourage spinning in tight space
+                cmd_out.angular.z = max(-self.max_angular_speed,
+                                        min(self.max_angular_speed,
+                                            0.5 * cmd_in.angular.z))
             self.pub_cmd.publish(cmd_out)
             return
 
-        if min_clearance > (self.slowdown_margin + abs(cmd_out.linear.x) * 0.8):
+        # Map-frame direction of motion = R(yaw) * [vx_b, vy_b]
+        cos_y = math.cos(r_yaw)
+        sin_y = math.sin(r_yaw)
+        dx = cos_y * vx_b - sin_y * vy_b
+        dy = sin_y * vx_b + cos_y * vy_b
+        # Normalize to unit direction
+        inv = 1.0 / max(1e-6, math.hypot(dx, dy))
+        ux, uy = dx * inv, dy * inv
+        # Lateral unit (left of motion)
+        lx, ly = -uy, ux
+
+        min_clear, left_density, right_density = self.scan_corridor(rx, ry, ux, uy, lx, ly)
+
+        if min_clear is None:
+            # unknown ahead/behind: be cautious
+            max_lin = 0.4
+            scale = min(1.0, max_lin / max(1e-6, v_mag))
+            cmd_out.linear.x *= scale
+            cmd_out.linear.y *= scale
             self.pub_cmd.publish(cmd_out)
             return
 
-        safe_lin = max(0.0, min(cmd_out.linear.x, max(0.0, min_clearance - self.slowdown_margin)))
+        # Compute allowed magnitude given slowdown margin
+        if min_clear > (self.slowdown_margin + 0.8 * v_mag):
+            # publish as-is
+            self.pub_cmd.publish(cmd_out)
+            return
+
+        allowed = max(0.0, min(min_clear - self.slowdown_margin, v_mag))
+        if v_mag > 1e-6:
+            scale = allowed / v_mag
+        else:
+            scale = 0.0
+        cmd_out.linear.x *= scale
+        cmd_out.linear.y *= scale
+
+        # Steering away from denser side
         steer = 0.0
-        if left_density is not None and right_density is not None:
-            steer_dir = -1.0 if left_density > right_density else 1.0
-            magnitude = min(1.0, abs(left_density - right_density))
+        if (left_density is not None) and (right_density is not None):
+            diff = left_density - right_density
+            steer_dir = -1.0 if diff > 0.0 else 1.0  # steer away from denser side
+            magnitude = min(1.0, abs(diff))
             steer = steer_dir * self.max_angular_speed * magnitude
         elif left_density is not None:
             steer = -0.5 * self.max_angular_speed
         elif right_density is not None:
             steer = 0.5 * self.max_angular_speed
 
-        if min_clearance < 0.15:
-            safe_lin = 0.0
-
-        cmd_out.linear.x = safe_lin
+        # Apply angular steer (diff drive) and a small lateral bias if robot supports vy
         cmd_out.angular.z = max(-self.max_angular_speed,
                                 min(self.max_angular_speed,
                                     cmd_out.angular.z + steer))
+
+        # Lateral nudge away from denser side for holonomic bases
+        # Map steer sign (+1 => steer to the right of motion, -1 => to the left)
+        # Convert to body-frame vy tweak proportional to avoid_gain
+        if self.lateral_avoid_gain > 0.0 and v_mag > 1e-6:
+            # desired lateral change in map frame (per unit time)
+            vy_nudge_map = 0.0
+            if (left_density is not None) and (right_density is not None):
+                vy_nudge_map = (-1.0 if left_density > right_density else 1.0) * self.lateral_avoid_gain * self.max_angular_speed
+            elif left_density is not None:
+                vy_nudge_map = -0.5 * self.lateral_avoid_gain * self.max_angular_speed
+            elif right_density is not None:
+                vy_nudge_map = 0.5 * self.lateral_avoid_gain * self.max_angular_speed
+
+            # map-frame lateral unit is (lx, ly); project nudge onto body-frame y
+            # body-frame y axis in map frame is R(yaw) * [0,1] = [-sin(yaw), cos(yaw)]
+            byx, byy = -sin_y, cos_y
+            # magnitude along body y is dot(nudge_vec_map, body_y_dir)
+            nudge_body_y = vy_nudge_map * (lx * byx + ly * byy)
+            cmd_out.linear.y += nudge_body_y
+
+        # Hard stop if too close
+        if (min_clear < 0.15):
+            cmd_out.linear.x = 0.0
+            cmd_out.linear.y = 0.0
+
         self.pub_cmd.publish(cmd_out)
 
     def get_robot_pose_in_map(self) -> Optional[Tuple[float, float, float]]:
-        """Return (x, y, yaw) of robot in the costmap (map) frame without tf_transformations."""
+        """Return (x, y, yaw) of robot in the map frame without tf_transformations."""
         try:
             # robot pose in odom
             o = self.latest_odom.pose.pose
@@ -198,20 +280,17 @@ class CollisionAvoid(Node):
             self.get_logger().warn(f'TF lookup failed: {e}')
             return None
 
-    def scan_corridor(self, rx: float, ry: float, r_yaw: float) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-        """
-        Sample a rectangular corridor ahead of the robot and return:
-        - min_clearance (meters to nearest obstacle along center/nearby rays)
-        - left_density (0..1) occupancy fraction in left band
-        - right_density (0..1) occupancy fraction in right band
-        """
+    # ---- Scanning helpers ----
+    def is_obstacle_within_radius(self, rx: float, ry: float, r_yaw: float, radius: float) -> bool:
         grid = self.latest_costmap
+        if grid is None:
+            return False
         res = grid.info.resolution
         origin_x = grid.info.origin.position.x
         origin_y = grid.info.origin.position.y
         width = grid.info.width
         height = grid.info.height
-        data = grid.data  # flat list: row-major
+        data = grid.data
 
         def world_to_idx(wx, wy):
             mx = int((wx - origin_x) / res)
@@ -220,9 +299,44 @@ class CollisionAvoid(Node):
                 return None
             return my * width + mx
 
-        # Unit vectors for forward and left in map frame
-        fx, fy = math.cos(r_yaw), math.sin(r_yaw)
-        lx, ly = -math.sin(r_yaw), math.cos(r_yaw)
+        step = max(res, 0.05)
+        r2 = radius * radius
+        x = rx - radius
+        while x <= rx + radius:
+            y = ry - radius
+            while y <= ry + radius:
+                if (x - rx) ** 2 + (y - ry) ** 2 <= r2:
+                    idx = world_to_idx(x, y)
+                    if idx is not None and data[idx] >= self.occupied_threshold:
+                        return True
+                y += step
+            x += step
+        return False
+
+    def scan_corridor(self, rx: float, ry: float, ux: float, uy: float, lx: float, ly: float) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+        """
+        Scan a rectangular corridor aligned with the unit motion direction (ux,uy)
+        and its left lateral unit (lx,ly). Returns:
+        - min_clearance (meters along +/− the motion direction)
+        - left_density (0..1) occupancy fraction in left band
+        - right_density (0..1) occupancy fraction in right band
+        Note: corridor extends only in the +direction of (ux,uy); if the commanded
+        velocity is negative along body x, (ux,uy) already points backwards in map.
+        """
+        grid = self.latest_costmap
+        res = grid.info.resolution
+        origin_x = grid.info.origin.position.x
+        origin_y = grid.info.origin.position.y
+        width = grid.info.width
+        height = grid.info.height
+        data = grid.data  # flat row-major
+
+        def world_to_idx(wx, wy):
+            mx = int((wx - origin_x) / res)
+            my = int((wy - origin_y) / res)
+            if mx < 0 or my < 0 or mx >= width or my >= height:
+                return None
+            return my * width + mx
 
         min_clear = None
         left_hits = right_hits = 0
@@ -236,14 +350,14 @@ class CollisionAvoid(Node):
             dist = 0.0
             step = max(self.sampling_step, res)
             while dist <= self.lookahead:
-                wx = rx + fx * dist + lx * offset
-                wy = ry + fy * dist + ly * offset
+                wx = rx + ux * dist + lx * offset
+                wy = ry + uy * dist + ly * offset
                 idx = world_to_idx(wx, wy)
                 if idx is None:
                     break
                 occ = data[idx]
                 if occ >= self.occupied_threshold:
-                    if min_clear is None or dist < min_clear:
+                    if (min_clear is None) or (dist < min_clear):
                         min_clear = dist
                     if band == 'left':
                         left_hits += 1
@@ -262,6 +376,8 @@ class CollisionAvoid(Node):
         right_density = (right_hits / right_total) if right_total > 0 else None
         return min_clear, left_density, right_density
 
+
+# --------------- main -----------------
 
 def main(args=None):
     rclpy.init(args=args)
