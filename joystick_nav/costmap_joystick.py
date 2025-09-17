@@ -7,6 +7,7 @@ Collision-avoidance command mux that supports forward, lateral, and backward mot
   corridor aligned with the intended motion in the map frame.
 - Scales linear speed (both x and y) by free clearance along that direction.
 - Steers away from higher obstacle density (angular.z for diff drive).
+- Supports a /joy override: if designated buttons (4 and 5) are pressed, bypass safety and forward raw cmd_vel.
 
 ROS 2 Humble, Python.
 """
@@ -20,6 +21,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
 from nav_msgs.msg import OccupancyGrid, Odometry
 from geometry_msgs.msg import Twist
+from sensor_msgs.msg import Joy
 
 import tf2_ros
 from geometry_msgs.msg import TransformStamped
@@ -46,11 +48,6 @@ def compose_map_pose_from_odom(
     ox: float, oy: float, oyaw: float,
     tmo_x: float, tmo_y: float, tmo_yaw: float
 ) -> Tuple[float, float, float]:
-    """
-    Compose map<-odom transform with robot pose in odom to get map pose.
-    map_p = T_map_odom * odom_p
-    Where T_map_odom is (tmo_x, tmo_y, tmo_yaw).
-    """
     cos_t = math.cos(tmo_yaw)
     sin_t = math.sin(tmo_yaw)
     mx = tmo_x + cos_t * ox - sin_t * oy
@@ -63,6 +60,21 @@ def compose_map_pose_from_odom(
 
 class CollisionAvoid(Node):
     def __init__(self):
+        """
+        ROS 2 node that acts as a safety layer between teleop commands and the robot.
+
+
+        - Subscribes to a costmap, odometry, joystick input, and raw velocity commands.
+        - Computes the robot pose in the map frame and scans a rectangular corridor
+        aligned with the commanded motion (forward, backward, or lateral).
+        - Adjusts or overrides the incoming velocity to avoid collisions:
+        * Scales linear velocity based on free clearance ahead/behind.
+        * Adds steering or lateral bias away from denser obstacle regions.
+        * Stops completely if an obstacle is too close.
+        - When both override buttons on the joystick are pressed, bypasses the safety
+        layer and forwards commands unchanged.
+        - Publishes the resulting safe Twist to the configured output topic.
+        """
         super().__init__('costmap_joystick')
 
         # Parameters
@@ -70,18 +82,21 @@ class CollisionAvoid(Node):
         self.declare_parameter('cmd_vel_in', '/cmd_vel_joy')
         self.declare_parameter('cmd_vel_out', '/cmd_vel')
         self.declare_parameter('odom_topic', '/odom')
-        self.declare_parameter('occupied_threshold', 70)     # occupancy 0..100
-        self.declare_parameter('lookahead', 1.0)             # [m]
-        self.declare_parameter('corridor_width', 0.3)        # [m] half-width each side
-        self.declare_parameter('sampling_step', 0.05)        # [m]
-        self.declare_parameter('max_angular_speed', 1.2)     # [rad/s]
-        self.declare_parameter('slowdown_margin', 0.4)       # [m]
+        self.declare_parameter('occupied_threshold', 70)
+        self.declare_parameter('lookahead', 1.0)
+        self.declare_parameter('corridor_width', 0.4)
+        self.declare_parameter('sampling_step', 0.05)
+        self.declare_parameter('max_angular_speed', 1.0)
+        self.declare_parameter('max_linear_speed', 0.3)
+        self.declare_parameter('max_lateral_speed', 0.15)
+        self.declare_parameter('slowdown_margin', 0.4)
         self.declare_parameter('map_frame', 'map')
         self.declare_parameter('odom_frame', 'odom')
-        # Lateral avoidance (for holonomic robots): how much to tweak vy
-        self.declare_parameter('lateral_avoid_gain', 0.6)    # fraction of max_angular_speed mapped to vy tweak
-        # When rotating in place with small |v|, radius around robot to check
-        self.declare_parameter('rot_safety_radius', 0.35)    # [m]
+        self.declare_parameter('lateral_avoid_gain', 0.6)
+        self.declare_parameter('rot_safety_radius', 0.35)
+
+        # Safety override buttons (index list)
+        self.override_buttons = [4, 5]
 
         # Resolve parameters
         self.costmap_topic = self.get_parameter('costmap_topic').value
@@ -93,6 +108,8 @@ class CollisionAvoid(Node):
         self.corridor_width = float(self.get_parameter('corridor_width').value)
         self.sampling_step = float(self.get_parameter('sampling_step').value)
         self.max_angular_speed = float(self.get_parameter('max_angular_speed').value)
+        self.max_linear_speed = float(self.get_parameter('max_linear_speed').value)
+        self.max_lateral_speed = float(self.get_parameter('max_lateral_speed').value)
         self.slowdown_margin = float(self.get_parameter('slowdown_margin').value)
         self.map_frame = self.get_parameter('map_frame').value
         self.odom_frame = self.get_parameter('odom_frame').value
@@ -103,9 +120,10 @@ class CollisionAvoid(Node):
         self.latest_costmap: Optional[OccupancyGrid] = None
         self.latest_odom: Optional[Odometry] = None
         self.latest_cmd_in: Optional[Twist] = None
+        self.joy_override_active: bool = False
 
         # TF buffer/listener
-        self.tf_buffer = tf2_ros.Buffer()  # default cache time
+        self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
         # QoS
@@ -126,12 +144,15 @@ class CollisionAvoid(Node):
         self.sub_cmd = self.create_subscription(
             Twist, self.cmd_vel_in_topic, self.on_cmd_in, default_qos
         )
+        self.sub_joy = self.create_subscription(
+            Joy, '/joy', self.on_joy, default_qos
+        )
         self.pub_cmd = self.create_publisher(Twist, self.cmd_vel_out_topic, 10)
 
         # 20 Hz control loop
         self.timer = self.create_timer(0.05, self.control_step)
 
-        self.get_logger().info('collision_avoid_cmd_mux (holonomic) ready.')
+        self.get_logger().info('collision_avoid_cmd_mux (holonomic) with joy override ready.')
 
     # ---- Callbacks ----
     def on_costmap(self, msg: OccupancyGrid):
@@ -143,11 +164,21 @@ class CollisionAvoid(Node):
     def on_cmd_in(self, msg: Twist):
         self.latest_cmd_in = msg
 
+    def on_joy(self, msg: Joy):
+        active = all((i < len(msg.buttons) and msg.buttons[i] == 1) for i in self.override_buttons)
+        self.joy_override_active = active
+
     # ---- Core logic ----
     def control_step(self):
         cmd_in = self.latest_cmd_in
         if cmd_in is None:
             return
+
+        # If override active, bypass safety and forward raw input
+        if self.joy_override_active:
+            self.pub_cmd.publish(cmd_in)
+            return
+
         if self.latest_costmap is None or self.latest_odom is None:
             self.pub_cmd.publish(cmd_in)
             return
@@ -194,7 +225,7 @@ class CollisionAvoid(Node):
 
         if min_clear is None:
             # unknown ahead/behind: be cautious
-            max_lin = 0.4
+            max_lin = self.max_linear_speed
             scale = min(1.0, max_lin / max(1e-6, v_mag))
             cmd_out.linear.x *= scale
             cmd_out.linear.y *= scale
@@ -233,17 +264,15 @@ class CollisionAvoid(Node):
                                     cmd_out.angular.z + steer))
 
         # Lateral nudge away from denser side for holonomic bases
-        # Map steer sign (+1 => steer to the right of motion, -1 => to the left)
-        # Convert to body-frame vy tweak proportional to avoid_gain
         if self.lateral_avoid_gain > 0.0 and v_mag > 1e-6:
             # desired lateral change in map frame (per unit time)
             vy_nudge_map = 0.0
             if (left_density is not None) and (right_density is not None):
-                vy_nudge_map = (-1.0 if left_density > right_density else 1.0) * self.lateral_avoid_gain * self.max_angular_speed
+                vy_nudge_map = (-1.0 if left_density > right_density else 1.0) * self.lateral_avoid_gain * self.max_lateral_speed
             elif left_density is not None:
-                vy_nudge_map = -0.5 * self.lateral_avoid_gain * self.max_angular_speed
+                vy_nudge_map = -0.5 * self.lateral_avoid_gain * self.max_lateral_speed
             elif right_density is not None:
-                vy_nudge_map = 0.5 * self.lateral_avoid_gain * self.max_angular_speed
+                vy_nudge_map = 0.5 * self.lateral_avoid_gain * self.max_lateral_speed
 
             # map-frame lateral unit is (lx, ly); project nudge onto body-frame y
             # body-frame y axis in map frame is R(yaw) * [0,1] = [-sin(yaw), cos(yaw)]
@@ -376,8 +405,6 @@ class CollisionAvoid(Node):
         right_density = (right_hits / right_total) if right_total > 0 else None
         return min_clear, left_density, right_density
 
-
-# --------------- main -----------------
 
 def main(args=None):
     rclpy.init(args=args)
