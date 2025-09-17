@@ -81,15 +81,16 @@ class CollisionAvoid(Node):
         self.declare_parameter('costmap_topic', '/global_costmap/costmap')
         self.declare_parameter('cmd_vel_in', '/cmd_vel_joy')
         self.declare_parameter('cmd_vel_out', '/cmd_vel')
-        self.declare_parameter('odom_topic', '/odom')
-        self.declare_parameter('occupied_threshold', 70)
-        self.declare_parameter('lookahead', 1.0)
+        self.declare_parameter('odom_topic', '/aft_mapped_to_init')
+        self.declare_parameter('occupied_threshold', 90)
+        self.declare_parameter('lookahead', 1.5)
         self.declare_parameter('corridor_width', 0.4)
         self.declare_parameter('sampling_step', 0.05)
         self.declare_parameter('max_angular_speed', 1.0)
-        self.declare_parameter('max_linear_speed', 0.3)
-        self.declare_parameter('max_lateral_speed', 0.15)
-        self.declare_parameter('slowdown_margin', 0.4)
+        self.declare_parameter('max_linear_speed', 0.4)
+        self.declare_parameter('max_lateral_speed', 0.2)
+        self.declare_parameter('slowdown_margin', 0.7)
+        self.declare_parameter('stop_margin', 0.3)      # increase for earlier stop
         self.declare_parameter('map_frame', 'map')
         self.declare_parameter('odom_frame', 'odom')
         self.declare_parameter('lateral_avoid_gain', 0.6)
@@ -115,6 +116,8 @@ class CollisionAvoid(Node):
         self.odom_frame = self.get_parameter('odom_frame').value
         self.lateral_avoid_gain = float(self.get_parameter('lateral_avoid_gain').value)
         self.rot_safety_radius = float(self.get_parameter('rot_safety_radius').value)
+        self.stop_margin = float(self.get_parameter('stop_margin').value)
+
 
         # State
         self.latest_costmap: Optional[OccupancyGrid] = None
@@ -174,17 +177,19 @@ class CollisionAvoid(Node):
         if cmd_in is None:
             return
 
-        # If override active, bypass safety and forward raw input
         if self.joy_override_active:
+            self.get_logger().info("Joy override active: forwarding raw input")
             self.pub_cmd.publish(cmd_in)
             return
 
         if self.latest_costmap is None or self.latest_odom is None:
+            self.get_logger().info("Costmap or odom not available, forwarding input")
             self.pub_cmd.publish(cmd_in)
             return
 
         pose_map = self.get_robot_pose_in_map()
         if pose_map is None:
+            self.get_logger().info("Could not get robot pose in map, forwarding input")
             self.pub_cmd.publish(cmd_in)
             return
 
@@ -238,13 +243,22 @@ class CollisionAvoid(Node):
             self.pub_cmd.publish(cmd_out)
             return
 
-        allowed = max(0.0, min(min_clear - self.slowdown_margin, v_mag))
-        if v_mag > 1e-6:
-            scale = allowed / v_mag
-        else:
-            scale = 0.0
-        cmd_out.linear.x *= scale
-        cmd_out.linear.y *= scale
+        # Hard stop if too close
+        if min_clear < self.stop_margin:
+            cmd_out.linear.x = 0.0
+            cmd_out.linear.y = 0.0
+            self.pub_cmd.publish(cmd_out)
+            self.get_logger().info(f"Emergency stop: obstacle at {min_clear:.2f} m")
+            return
+
+        if min_clear < self.slowdown_margin:
+            # Scale down linearly between stop_margin and slowdown_margin
+            scale = (min_clear - self.stop_margin) / max(1e-3, self.slowdown_margin - self.stop_margin)
+            scale = max(0.0, min(1.0, scale))
+            cmd_out.linear.x *= scale
+            cmd_out.linear.y *= scale
+
+        self.pub_cmd.publish(cmd_out)
 
         # Steering away from denser side
         steer = 0.0
@@ -282,9 +296,13 @@ class CollisionAvoid(Node):
             cmd_out.linear.y += nudge_body_y
 
         # Hard stop if too close
-        if (min_clear < 0.15):
+        if (min_clear < self.stop_margin):
             cmd_out.linear.x = 0.0
             cmd_out.linear.y = 0.0
+            self.pub_cmd.publish(cmd_out)
+            self.get_logger().info(f"Emergency stop: obstacle at {min_clear:.2f} m")
+            return
+
 
         self.pub_cmd.publish(cmd_out)
 
