@@ -96,7 +96,7 @@ class CollisionAvoid(Node):
         self.declare_parameter('rot_safety_radius', 0.35)
 
         # Safety override buttons (index list)
-        self.override_buttons = [4, 5]
+        self.override_buttons = [6, 7]
 
         # Resolve parameters
         self.costmap_topic = self.get_parameter('costmap_topic').value
