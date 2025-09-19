@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+### TODO: REPLACE /costmap BY THE ACTUAL /cloud_registered TO DETECT OBSTACLES
+### WITHOUT RELYING ON MAP
+
 """
 Collision-avoidance command mux that supports forward, lateral, and backward motion.
 - Considers the commanded body-frame (vx, vy) direction to scan a rectangular
