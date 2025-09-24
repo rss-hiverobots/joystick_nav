@@ -83,7 +83,7 @@ class CollisionAvoid(Node):
         # Parameters
         self.declare_parameter('costmap_topic', '/global_costmap/costmap')
         self.declare_parameter('cmd_vel_in', '/cmd_vel_joy')
-        self.declare_parameter('cmd_vel_out', '/cmd_vel')
+        self.declare_parameter('cmd_vel_out', '/cmd_vel_joy_safe')
         self.declare_parameter('odom_topic', '/aft_mapped_to_init')
         self.declare_parameter('occupied_threshold', 90)
         self.declare_parameter('lookahead', 1.5)

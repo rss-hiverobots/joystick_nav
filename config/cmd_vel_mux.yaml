@@ -2,10 +2,13 @@ twist_mux:
   ros__parameters:
     topics:
       nav:
-        topic: /cmd_vel_nav
+        topic: /cmd_vel
         timeout: 0.5
         priority: 20
       joy:
         topic: /cmd_vel_joy_safe
         timeout: 0.5
         priority: 50
+
+# Timeout: If no message is received on a topic for this duration, it is considered inactive.
+# Priority: Higher priority topics override lower priority ones.
