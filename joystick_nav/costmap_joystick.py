@@ -10,7 +10,7 @@ Collision-avoidance command mux that supports forward, lateral, and backward mot
   corridor aligned with the intended motion in the map frame.
 - Scales linear speed (both x and y) by free clearance along that direction.
 - Steers away from higher obstacle density (angular.z for diff drive).
-- Supports a /joy override: if designated buttons (4 and 5) are pressed, bypass safety and forward raw cmd_vel.
+- Supports a /joy override: if designated buttons (6 and 7) are pressed, bypass safety and forward raw cmd_vel.
 
 ROS 2 Humble, Python.
 """
@@ -65,18 +65,6 @@ class CollisionAvoid(Node):
     def __init__(self):
         """
         ROS 2 node that acts as a safety layer between teleop commands and the robot.
-
-
-        - Subscribes to a costmap, odometry, joystick input, and raw velocity commands.
-        - Computes the robot pose in the map frame and scans a rectangular corridor
-        aligned with the commanded motion (forward, backward, or lateral).
-        - Adjusts or overrides the incoming velocity to avoid collisions:
-        * Scales linear velocity based on free clearance ahead/behind.
-        * Adds steering or lateral bias away from denser obstacle regions.
-        * Stops completely if an obstacle is too close.
-        - When both override buttons on the joystick are pressed, bypasses the safety
-        layer and forwards commands unchanged.
-        - Publishes the resulting safe Twist to the configured output topic.
         """
         super().__init__('costmap_joystick')
 
@@ -98,6 +86,7 @@ class CollisionAvoid(Node):
         self.declare_parameter('odom_frame', 'odom')
         self.declare_parameter('lateral_avoid_gain', 0.6)
         self.declare_parameter('rot_safety_radius', 0.35)
+        self.declare_parameter('cmd_timeout', 0.5)       # seconds without new cmd -> publish nothing
 
         # Safety override buttons (index list)
         self.override_buttons = [6, 7]
@@ -120,13 +109,14 @@ class CollisionAvoid(Node):
         self.lateral_avoid_gain = float(self.get_parameter('lateral_avoid_gain').value)
         self.rot_safety_radius = float(self.get_parameter('rot_safety_radius').value)
         self.stop_margin = float(self.get_parameter('stop_margin').value)
-
+        self.cmd_timeout = float(self.get_parameter('cmd_timeout').value)
 
         # State
         self.latest_costmap: Optional[OccupancyGrid] = None
         self.latest_odom: Optional[Odometry] = None
         self.latest_cmd_in: Optional[Twist] = None
         self.joy_override_active: bool = False
+        self.last_cmd_time = None
 
         # TF buffer/listener
         self.tf_buffer = tf2_ros.Buffer()
@@ -169,6 +159,7 @@ class CollisionAvoid(Node):
 
     def on_cmd_in(self, msg: Twist):
         self.latest_cmd_in = msg
+        self.last_cmd_time = self.get_clock().now()
 
     def on_joy(self, msg: Joy):
         active = all((i < len(msg.buttons) and msg.buttons[i] == 1) for i in self.override_buttons)
@@ -176,9 +167,15 @@ class CollisionAvoid(Node):
 
     # ---- Core logic ----
     def control_step(self):
-        cmd_in = self.latest_cmd_in
-        if cmd_in is None:
+        # Require a *fresh* command before publishing anything
+        if self.latest_cmd_in is None or self.last_cmd_time is None:
             return
+        age = (self.get_clock().now() - self.last_cmd_time).nanoseconds * 1e-9
+        if age > self.cmd_timeout:
+            # stale: do not publish
+            return
+
+        cmd_in = self.latest_cmd_in
 
         if self.joy_override_active:
             self.get_logger().info("Joy override active: forwarding raw input")
@@ -298,14 +295,13 @@ class CollisionAvoid(Node):
             nudge_body_y = vy_nudge_map * (lx * byx + ly * byy)
             cmd_out.linear.y += nudge_body_y
 
-        # Hard stop if too close
+        # Hard stop if too close (redundant guard; safe to keep)
         if (min_clear < self.stop_margin):
             cmd_out.linear.x = 0.0
             cmd_out.linear.y = 0.0
             self.pub_cmd.publish(cmd_out)
             self.get_logger().info(f"Emergency stop: obstacle at {min_clear:.2f} m")
             return
-
 
         self.pub_cmd.publish(cmd_out)
 
@@ -327,7 +323,7 @@ class CollisionAvoid(Node):
             mx, my, myaw = compose_map_pose_from_odom(ox, oy, oyaw, t.x, t.y, tmo_yaw)
             return mx, my, myaw
         except Exception as e:
-            self.get_logger().warn(f'TF lookup failed: {e}')
+            self.get_logger().warning(f'TF lookup failed: {e}')
             return None
 
     # ---- Scanning helpers ----

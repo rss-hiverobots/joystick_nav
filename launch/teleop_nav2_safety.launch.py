@@ -11,6 +11,9 @@ def generate_launch_description():
             executable='joy_node',
             name='joy_node',
             output='screen',
+            parameters=[
+                '/home/rss/Documents/02_ROS2/ros2_humble_ws/src/joystick_nav/config/joy_params.yaml'
+            ]
         ),
         # 2. teleop_twist_joy node with param file and remapping
         Node(
