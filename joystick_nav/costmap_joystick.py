@@ -1,437 +1,315 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-### TODO: REPLACE /costmap BY THE ACTUAL /cloud_registered TO DETECT OBSTACLES
-### WITHOUT RELYING ON MAP
-
 """
-Collision-avoidance command mux that supports forward, lateral, and backward motion.
-- Considers the commanded body-frame (vx, vy) direction to scan a rectangular
-  corridor aligned with the intended motion in the map frame.
-- Scales linear speed (both x and y) by free clearance along that direction.
-- Steers away from higher obstacle density (angular.z for diff drive).
-- Supports a /joy override: if designated buttons (6 and 7) are pressed, bypass safety and forward raw cmd_vel.
+Safety-gating velocity node for Livox + joystick control (ROS 2 Humble, Python).
 
-ROS 2 Humble, Python.
+- Sub:  /livox/lidar      (livox_ros_driver2/msg/CustomMsg)
+- Sub:  /cmd_vel_joy      (geometry_msgs/msg/Twist)   <-- raw joystick cmd
+- Sub:  /joy              (sensor_msgs/msg/Joy)       <-- for override buttons
+- Pub:  /cmd_vel_joy_safe (geometry_msgs/msg/Twist)   <-- safety-filtered cmd
+
+Logic:
+- From latest Livox CustomMsg, discard points considered floor (z <= floor_z_max)
+  and points closer than min_ignore_range (sensor clutter/hood).
+- When a /cmd_vel_joy arrives:
+    * If override is active (both buttons pressed), forward it as-is.
+    * Else, compute heading from (vx, vy). Measure the minimum distance to any
+      non-floor point inside an angular sector around that heading. Scale linear
+      velocity by:
+          scale = clamp((d - stop_distance) / (slow_distance - stop_distance), 0..1)
+      so it slows down and stops when d <= stop_distance.
+    * If |v| ~ 0, publish the same (near-zero) Twist (no need to compute scale).
+- If we haven't yet received /cmd_vel_joy, do not publish anything.
+
+Notes:
+- Assumes Livox frame z-axis is up (or roughly aligned to base frame z). Adjust
+  floor_z_max if your sensor sits below base_link or is tilted.
+- For multi-directional motion (vx, vy), the sector points in the instant
+  intended motion direction.
 """
 
 import math
-from typing import Optional, Tuple
+from typing import List, Optional
 
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
-from nav_msgs.msg import OccupancyGrid, Odometry
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import Joy
 
-import tf2_ros
-from geometry_msgs.msg import TransformStamped
+# Livox messages
+from livox_ros_driver2.msg import CustomMsg  # points are CustomPoint[] within
 
-
-# --------- small math helpers ---------
-
-def yaw_from_quat_xyzw(x: float, y: float, z: float, w: float) -> float:
-    """Minimal quaternion->yaw (ROS ordering x,y,z,w)."""
-    s = 2.0 * (w * z + x * y)
-    c = 1.0 - 2.0 * (y * y + z * z)
-    return math.atan2(s, c)
-
-
-def wrap_to_pi(a: float) -> float:
-    while a > math.pi:
-        a -= 2.0 * math.pi
-    while a < -math.pi:
-        a += 2.0 * math.pi
-    return a
-
-
-def compose_map_pose_from_odom(
-    ox: float, oy: float, oyaw: float,
-    tmo_x: float, tmo_y: float, tmo_yaw: float
-) -> Tuple[float, float, float]:
-    cos_t = math.cos(tmo_yaw)
-    sin_t = math.sin(tmo_yaw)
-    mx = tmo_x + cos_t * ox - sin_t * oy
-    my = tmo_y + sin_t * ox + cos_t * oy
-    myaw = wrap_to_pi(oyaw + tmo_yaw)
-    return mx, my, myaw
-
-
-# --------------- Node -----------------
-
-class CollisionAvoid(Node):
+class CmdVelSafety(Node):
     def __init__(self):
-        """
-        ROS 2 node that acts as a safety layer between teleop commands and the robot.
-        """
-        super().__init__('costmap_joystick')
+        super().__init__('cmd_vel_joy_safety')
 
-        # Parameters
-        self.declare_parameter('costmap_topic', '/global_costmap/costmap')
-        self.declare_parameter('cmd_vel_in', '/cmd_vel_joy')
-        self.declare_parameter('cmd_vel_out', '/cmd_vel_joy_safe')
-        self.declare_parameter('odom_topic', '/aft_mapped_to_init')
-        self.declare_parameter('occupied_threshold', 90)
-        self.declare_parameter('lookahead', 1.5)
-        self.declare_parameter('corridor_width', 0.4)
-        self.declare_parameter('sampling_step', 0.05)
-        self.declare_parameter('max_angular_speed', 1.0)
-        self.declare_parameter('max_linear_speed', 0.4)
-        self.declare_parameter('max_lateral_speed', 0.2)
-        self.declare_parameter('slowdown_margin', 0.7)
-        self.declare_parameter('stop_margin', 0.3)      # increase for earlier stop
-        self.declare_parameter('map_frame', 'map')
-        self.declare_parameter('odom_frame', 'odom')
-        self.declare_parameter('lateral_avoid_gain', 0.6)
-        self.declare_parameter('rot_safety_radius', 0.35)
-        self.declare_parameter('cmd_timeout', 0.5)       # seconds without new cmd -> publish nothing
+        # ---------------- Parameters (declare & defaults) ----------------
+        # Safety distances (meters)
+        self.declare_parameter('slow_distance', 1.0)        # start slowing
+        self.declare_parameter('stop_distance', 0.2)        # full stop
+        self.declare_parameter('min_ignore_range', 0.15)    # ignore ultra-near speckle
+        self.declare_parameter('floor_z_max', -1.0)         # (m) z <= this is considered floor
+        self.declare_parameter('sector_half_angle_deg', 35.0) # half-angle of sector
+        self.declare_parameter('lidar_timeout_sec', 0.25)   # consider lidar stale after this
+        self.declare_parameter('override_buttons', [6, 7])  # both must be pressed
+        self.declare_parameter('zero_hold_sec', 2.0)  # keep publishing zero for this long
 
-        # Safety override buttons (index list)
-        self.override_buttons = [6, 7]
+        # Topics (allow remapping via params if you like)
+        self.declare_parameter('lidar_topic', '/livox/lidar')
+        self.declare_parameter('cmd_in_topic', '/cmd_vel_joy')
+        self.declare_parameter('joy_topic', '/joy')
+        self.declare_parameter('cmd_out_topic', '/cmd_vel_joy_safe')
 
-        # Resolve parameters
-        self.costmap_topic = self.get_parameter('costmap_topic').value
-        self.cmd_vel_in_topic = self.get_parameter('cmd_vel_in').value
-        self.cmd_vel_out_topic = self.get_parameter('cmd_vel_out').value
-        self.odom_topic = self.get_parameter('odom_topic').value
-        self.occupied_threshold = int(self.get_parameter('occupied_threshold').value)
-        self.lookahead = float(self.get_parameter('lookahead').value)
-        self.corridor_width = float(self.get_parameter('corridor_width').value)
-        self.sampling_step = float(self.get_parameter('sampling_step').value)
-        self.max_angular_speed = float(self.get_parameter('max_angular_speed').value)
-        self.max_linear_speed = float(self.get_parameter('max_linear_speed').value)
-        self.max_lateral_speed = float(self.get_parameter('max_lateral_speed').value)
-        self.slowdown_margin = float(self.get_parameter('slowdown_margin').value)
-        self.map_frame = self.get_parameter('map_frame').value
-        self.odom_frame = self.get_parameter('odom_frame').value
-        self.lateral_avoid_gain = float(self.get_parameter('lateral_avoid_gain').value)
-        self.rot_safety_radius = float(self.get_parameter('rot_safety_radius').value)
-        self.stop_margin = float(self.get_parameter('stop_margin').value)
-        self.cmd_timeout = float(self.get_parameter('cmd_timeout').value)
+        # Read params
+        self.slow_distance = float(self.get_parameter('slow_distance').value)
+        self.stop_distance = float(self.get_parameter('stop_distance').value)
+        self.min_ignore_range = float(self.get_parameter('min_ignore_range').value)
+        self.floor_z_max = float(self.get_parameter('floor_z_max').value)
+        self.sector_half_angle = math.radians(
+            float(self.get_parameter('sector_half_angle_deg').value)
+        )
+        self.lidar_timeout_sec = float(self.get_parameter('lidar_timeout_sec').value)
+        self.override_buttons: List[int] = list(self.get_parameter('override_buttons').value)
+        self.zero_hold_sec = float(self.get_parameter('zero_hold_sec').value)
 
-        # State
-        self.latest_costmap: Optional[OccupancyGrid] = None
-        self.latest_odom: Optional[Odometry] = None
-        self.latest_cmd_in: Optional[Twist] = None
-        self.joy_override_active: bool = False
-        self.last_cmd_time = None
+        lidar_topic = self.get_parameter('lidar_topic').value
+        cmd_in_topic = self.get_parameter('cmd_in_topic').value
+        joy_topic = self.get_parameter('joy_topic').value
+        cmd_out_topic = self.get_parameter('cmd_out_topic').value
 
-        # TF buffer/listener
-        self.tf_buffer = tf2_ros.Buffer()
-        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        # ---------------- State ----------------
+        self.latest_lidar_msg: Optional[CustomMsg] = None
+        self.latest_lidar_stamp: Optional[rclpy.time.Time] = None
+        self.latest_joy_msg: Optional[Joy] = None
+        self.have_cmd_in: bool = False  # gate publishing until first /cmd_vel_joy arrives
+        # Zero-cmd suppression state
+        self._zero_since: Optional[rclpy.time.Time] = None  # when zero stream started
 
-        # QoS
-        costmap_qos = QoSProfile(
+
+        
+        # --- Debug state ---
+        self._z_stats_logged: bool = False   # print z-range once at startup
+        self.last_closest: Optional[tuple] = None  # (x, y, z, d) of closest in sector
+
+
+        # ---------------- QoS ----------------
+        qos_sensor = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
-            depth=1,
+            depth=5
         )
-        default_qos = QoSProfile(depth=10)
+        qos_cmd = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10
+        )
 
-        # IO
-        self.sub_costmap = self.create_subscription(
-            OccupancyGrid, self.costmap_topic, self.on_costmap, costmap_qos
-        )
-        self.sub_odom = self.create_subscription(
-            Odometry, self.odom_topic, self.on_odom, default_qos
+        # ---------------- Subscriptions ----------------
+        self.sub_lidar = self.create_subscription(
+            CustomMsg, lidar_topic, self.on_lidar, qos_sensor
         )
         self.sub_cmd = self.create_subscription(
-            Twist, self.cmd_vel_in_topic, self.on_cmd_in, default_qos
+            Twist, cmd_in_topic, self.on_cmd, qos_cmd
         )
         self.sub_joy = self.create_subscription(
-            Joy, '/joy', self.on_joy, default_qos
+            Joy, joy_topic, self.on_joy, qos_sensor
         )
-        self.pub_cmd = self.create_publisher(Twist, self.cmd_vel_out_topic, 10)
 
-        # 20 Hz control loop
-        self.timer = self.create_timer(0.05, self.control_step)
+        # ---------------- Publisher ----------------
+        self.pub_cmd = self.create_publisher(Twist, cmd_out_topic, qos_cmd)
 
-        self.get_logger().info('collision_avoid_cmd_mux (holonomic) with joy override ready.')
+        self.get_logger().info(
+            f"cmd_vel safety active | slow={self.slow_distance:.2f} m, stop={self.stop_distance:.2f} m, "
+            f"floor_z_max={self.floor_z_max:.2f} m, sector={math.degrees(self.sector_half_angle):.1f}°"
+        )
 
-    # ---- Callbacks ----
-    def on_costmap(self, msg: OccupancyGrid):
-        self.latest_costmap = msg
+    # ---------- Callbacks ----------
+    def on_lidar(self, msg: CustomMsg):
+        self.latest_lidar_msg = msg
+        # Debug: print z-range once at beginning
+        if not self._z_stats_logged and msg.points:
+            z_min = min(p.z for p in msg.points)
+            z_max = max(p.z for p in msg.points)
+            self.get_logger().info(f"[DBG] Livox Z range (first packet): min={z_min:.3f} m, max={z_max:.3f} m")
+            self._z_stats_logged = True
 
-    def on_odom(self, msg: Odometry):
-        self.latest_odom = msg
-
-    def on_cmd_in(self, msg: Twist):
-        self.latest_cmd_in = msg
-        self.last_cmd_time = self.get_clock().now()
+        # Convert msg time to ROS time (header.stamp if available; CustomMsg has header)
+        self.latest_lidar_stamp = self.get_clock().now()
 
     def on_joy(self, msg: Joy):
-        active = all((i < len(msg.buttons) and msg.buttons[i] == 1) for i in self.override_buttons)
-        self.joy_override_active = active
+        self.latest_joy_msg = msg
 
-    # ---- Core logic ----
-    def control_step(self):
-        # Require a *fresh* command before publishing anything
-        if self.latest_cmd_in is None or self.last_cmd_time is None:
-            return
-        age = (self.get_clock().now() - self.last_cmd_time).nanoseconds * 1e-9
-        if age > self.cmd_timeout:
-            # stale: do not publish
-            return
+    def on_cmd(self, msg: Twist):
+        # We only publish **in reaction** to an incoming cmd (no periodic 0s).
+        self.have_cmd_in = True
 
-        cmd_in = self.latest_cmd_in
-
-        if self.joy_override_active:
-            self.get_logger().info("Joy override active: forwarding raw input")
-            self.pub_cmd.publish(cmd_in)
+        # If override buttons are BOTH pressed, bypass safety
+        if self._override_active():
+            self._zero_since = None  # reset zero timer
+            self.pub_cmd.publish(msg)
             return
 
-        if self.latest_costmap is None or self.latest_odom is None:
-            self.get_logger().info("Costmap or odom not available, forwarding input")
-            self.pub_cmd.publish(cmd_in)
+        # If no significant motion commanded, forward as-is (it’s safe)
+        vx, vy = msg.linear.x, msg.linear.y
+        vmag = math.hypot(vx, vy)
+        if vmag < 1e-3 and abs(msg.angular.z) < 1e-3:
+            # Zero linear & zero angular: publish zeros only for zero_hold_sec, then stop publishing.
+            now = self.get_clock().now()
+            if self._zero_since is None:
+                self._zero_since = now
+            elapsed = (now - self._zero_since).nanoseconds * 1e-9
+            if elapsed <= self.zero_hold_sec:
+                self.pub_cmd.publish(msg)  # pass through zeros briefly (e.g., to stop smoothly)
+            # else: do not publish (go silent)
             return
+        else:
+            # Non-zero command (either linear or angular) — reset the zero timer
+            self._zero_since = None
 
-        pose_map = self.get_robot_pose_in_map()
-        if pose_map is None:
-            self.get_logger().info("Could not get robot pose in map, forwarding input")
-            self.pub_cmd.publish(cmd_in)
+
+        # Compute safety scale based on closest obstacle in heading sector
+        heading = math.atan2(vy, vx)  # radians in base frame (assuming lidar frame ~= base)
+        min_d = self._min_distance_in_sector(heading)
+
+        if min_d is None:
+            # No fresh lidar or no valid points -> be permissive: pass through
+            self.pub_cmd.publish(msg)
             return
+        
+        # Debug: print closest object detected in the commanded sector
+        if self.last_closest is not None:
+            cx, cy, cz, cd = self.last_closest
+            self.get_logger().info(
+                f"[DBG] Closest obj in sector: d={cd:.3f} m at (x={cx:.3f}, y={cy:.3f}, z={cz:.3f})"
+            )
 
-        rx, ry, r_yaw = pose_map
 
-        # Body-frame commanded linear velocity
-        vx_b = float(cmd_in.linear.x)
-        vy_b = float(cmd_in.linear.y)
-        v_mag = math.hypot(vx_b, vy_b)
+        # Scale linear speed based on distance
+        scale = self._speed_scale(min_d)
+        safe = Twist()
+        safe.linear.x = msg.linear.x * scale
+        safe.linear.y = msg.linear.y * scale
+        # Keep angular as commanded; optionally reduce if very close:
+        if scale <= 0.25:
+            safe.angular.z = msg.angular.z * max(scale, 0.25)
+        else:
+            safe.angular.z = msg.angular.z
 
-        cmd_out = Twist()
-        cmd_out.linear.x = vx_b
-        cmd_out.linear.y = vy_b
-        cmd_out.angular.z = cmd_in.angular.z
+        # If we had to stop (scale==0), ensure truly zero
+        if scale <= 0.0:
+            safe.linear.x = 0.0
+            safe.linear.y = 0.0
+            safe.angular.z = 0.0
 
-        # If essentially rotation-only, do a simple radial safety check and pass through
-        if v_mag < 1e-3:
-            if self.is_obstacle_within_radius(rx, ry, r_yaw, self.rot_safety_radius):
-                # discourage spinning in tight space
-                cmd_out.angular.z = max(-self.max_angular_speed,
-                                        min(self.max_angular_speed,
-                                            0.5 * cmd_in.angular.z))
-            self.pub_cmd.publish(cmd_out)
-            return
+        self.pub_cmd.publish(safe)
 
-        # Map-frame direction of motion = R(yaw) * [vx_b, vy_b]
-        cos_y = math.cos(r_yaw)
-        sin_y = math.sin(r_yaw)
-        dx = cos_y * vx_b - sin_y * vy_b
-        dy = sin_y * vx_b + cos_y * vy_b
-        # Normalize to unit direction
-        inv = 1.0 / max(1e-6, math.hypot(dx, dy))
-        ux, uy = dx * inv, dy * inv
-        # Lateral unit (left of motion)
-        lx, ly = -uy, ux
-
-        min_clear, left_density, right_density = self.scan_corridor(rx, ry, ux, uy, lx, ly)
-
-        if min_clear is None:
-            # unknown ahead/behind: be cautious
-            max_lin = self.max_linear_speed
-            scale = min(1.0, max_lin / max(1e-6, v_mag))
-            cmd_out.linear.x *= scale
-            cmd_out.linear.y *= scale
-            self.pub_cmd.publish(cmd_out)
-            return
-
-        # Compute allowed magnitude given slowdown margin
-        if min_clear > (self.slowdown_margin + 0.8 * v_mag):
-            # publish as-is
-            self.pub_cmd.publish(cmd_out)
-            return
-
-        # Hard stop if too close
-        if min_clear < self.stop_margin:
-            cmd_out.linear.x = 0.0
-            cmd_out.linear.y = 0.0
-            self.pub_cmd.publish(cmd_out)
-            self.get_logger().info(f"Emergency stop: obstacle at {min_clear:.2f} m")
-            return
-
-        if min_clear < self.slowdown_margin:
-            # Scale down linearly between stop_margin and slowdown_margin
-            scale = (min_clear - self.stop_margin) / max(1e-3, self.slowdown_margin - self.stop_margin)
-            scale = max(0.0, min(1.0, scale))
-            cmd_out.linear.x *= scale
-            cmd_out.linear.y *= scale
-
-        self.pub_cmd.publish(cmd_out)
-
-        # Steering away from denser side
-        steer = 0.0
-        if (left_density is not None) and (right_density is not None):
-            diff = left_density - right_density
-            steer_dir = -1.0 if diff > 0.0 else 1.0  # steer away from denser side
-            magnitude = min(1.0, abs(diff))
-            steer = steer_dir * self.max_angular_speed * magnitude
-        elif left_density is not None:
-            steer = -0.5 * self.max_angular_speed
-        elif right_density is not None:
-            steer = 0.5 * self.max_angular_speed
-
-        # Apply angular steer (diff drive) and a small lateral bias if robot supports vy
-        cmd_out.angular.z = max(-self.max_angular_speed,
-                                min(self.max_angular_speed,
-                                    cmd_out.angular.z + steer))
-
-        # Lateral nudge away from denser side for holonomic bases
-        if self.lateral_avoid_gain > 0.0 and v_mag > 1e-6:
-            # desired lateral change in map frame (per unit time)
-            vy_nudge_map = 0.0
-            if (left_density is not None) and (right_density is not None):
-                vy_nudge_map = (-1.0 if left_density > right_density else 1.0) * self.lateral_avoid_gain * self.max_lateral_speed
-            elif left_density is not None:
-                vy_nudge_map = -0.5 * self.lateral_avoid_gain * self.max_lateral_speed
-            elif right_density is not None:
-                vy_nudge_map = 0.5 * self.lateral_avoid_gain * self.max_lateral_speed
-
-            # map-frame lateral unit is (lx, ly); project nudge onto body-frame y
-            # body-frame y axis in map frame is R(yaw) * [0,1] = [-sin(yaw), cos(yaw)]
-            byx, byy = -sin_y, cos_y
-            # magnitude along body y is dot(nudge_vec_map, body_y_dir)
-            nudge_body_y = vy_nudge_map * (lx * byx + ly * byy)
-            cmd_out.linear.y += nudge_body_y
-
-        # Hard stop if too close (redundant guard; safe to keep)
-        if (min_clear < self.stop_margin):
-            cmd_out.linear.x = 0.0
-            cmd_out.linear.y = 0.0
-            self.pub_cmd.publish(cmd_out)
-            self.get_logger().info(f"Emergency stop: obstacle at {min_clear:.2f} m")
-            return
-
-        self.pub_cmd.publish(cmd_out)
-
-    def get_robot_pose_in_map(self) -> Optional[Tuple[float, float, float]]:
-        """Return (x, y, yaw) of robot in the map frame without tf_transformations."""
+    # ---------- Helpers ----------
+    def _override_active(self) -> bool:
+        if self.latest_joy_msg is None or not self.latest_joy_msg.buttons:
+            return False
+        # Both buttons pressed (value == 1)
         try:
-            # robot pose in odom
-            o = self.latest_odom.pose.pose
-            ox, oy = o.position.x, o.position.y
-            oyaw = yaw_from_quat_xyzw(o.orientation.x, o.orientation.y, o.orientation.z, o.orientation.w)
+            return all(
+                0 <= b < len(self.latest_joy_msg.buttons) and self.latest_joy_msg.buttons[b] == 1
+                for b in self.override_buttons
+            )
+        except Exception:
+            return False
 
-            # map <- odom transform (translation + yaw)
-            tf: TransformStamped = self.tf_buffer.lookup_transform(
-                self.map_frame, self.odom_frame, rclpy.time.Time())
-            t = tf.transform.translation
-            q = tf.transform.rotation
-            tmo_yaw = yaw_from_quat_xyzw(q.x, q.y, q.z, q.w)
+    def _lidar_is_fresh(self) -> bool:
+        if self.latest_lidar_stamp is None:
+            return False
+        age = (self.get_clock().now() - self.latest_lidar_stamp).nanoseconds * 1e-9
+        return age <= self.lidar_timeout_sec
 
-            mx, my, myaw = compose_map_pose_from_odom(ox, oy, oyaw, t.x, t.y, tmo_yaw)
-            return mx, my, myaw
-        except Exception as e:
-            self.get_logger().warning(f'TF lookup failed: {e}')
+    def _min_distance_in_sector(self, heading_rad: float) -> Optional[float]:
+        """
+        Returns the minimum planar (xy) distance to any non-floor, non-ignored point
+        within the angular sector centered on heading_rad. None if lidar stale or no points.
+        """
+        if not self._lidar_is_fresh() or self.latest_lidar_msg is None:
             return None
 
-    # ---- Scanning helpers ----
-    def is_obstacle_within_radius(self, rx: float, ry: float, r_yaw: float, radius: float) -> bool:
-        grid = self.latest_costmap
-        if grid is None:
-            return False
-        res = grid.info.resolution
-        origin_x = grid.info.origin.position.x
-        origin_y = grid.info.origin.position.y
-        width = grid.info.width
-        height = grid.info.height
-        data = grid.data
+        pts = self.latest_lidar_msg.points
+        if not pts:
+            return None
 
-        def world_to_idx(wx, wy):
-            mx = int((wx - origin_x) / res)
-            my = int((wy - origin_y) / res)
-            if mx < 0 or my < 0 or mx >= width or my >= height:
-                return None
-            return my * width + mx
+        half = self.sector_half_angle
+        min_d = None
+        closest_tuple = None  # (x, y, z, d)
 
-        step = max(res, 0.05)
-        r2 = radius * radius
-        x = rx - radius
-        while x <= rx + radius:
-            y = ry - radius
-            while y <= ry + radius:
-                if (x - rx) ** 2 + (y - ry) ** 2 <= r2:
-                    idx = world_to_idx(x, y)
-                    if idx is not None and data[idx] >= self.occupied_threshold:
-                        return True
-                y += step
-            x += step
-        return False
 
-    def scan_corridor(self, rx: float, ry: float, ux: float, uy: float, lx: float, ly: float) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+        # Precompute bounds to avoid repeated function calls
+        stop2 = self.stop_distance * self.stop_distance
+        ignore2 = self.min_ignore_range * self.min_ignore_range
+
+        # Iterate raw Livox points (CustomPoint: x,y,z, etc.)
+        for p in pts:
+            z = p.z
+            if z <= self.floor_z_max:
+                continue  # ignore floor
+            x, y = p.x, p.y
+            d2 = x * x + y * y
+            if d2 < ignore2:
+                continue  # ignore ultra-near speckle
+            # Angle of point in the plane
+            ang = math.atan2(y, x)
+            # Wrap smallest angular difference
+            dif = self._ang_diff(ang, heading_rad)
+            if abs(dif) <= half:
+                # candidate in sector
+                if min_d is None or d2 < min_d * min_d:
+                    d = math.sqrt(d2)
+                    closest_tuple = (x, y, z, d)
+                    # Fast path: if already within stop radius, we can short-circuit
+                    if d2 <= stop2:
+                        self.last_closest = closest_tuple
+                        return d
+                    min_d = d
+
+        # Save for debug printing in on_cmd
+        if min_d is not None and closest_tuple is not None:
+            self.last_closest = closest_tuple
+        else:
+            self.last_closest = None
+        return min_d
+
+
+    @staticmethod
+    def _ang_diff(a: float, b: float) -> float:
+        """Smallest signed angle a-b in [-pi, pi]."""
+        d = (a - b + math.pi) % (2.0 * math.pi) - math.pi
+        return d
+
+    def _speed_scale(self, d: float) -> float:
         """
-        Scan a rectangular corridor aligned with the unit motion direction (ux,uy)
-        and its left lateral unit (lx,ly). Returns:
-        - min_clearance (meters along +/− the motion direction)
-        - left_density (0..1) occupancy fraction in left band
-        - right_density (0..1) occupancy fraction in right band
-        Note: corridor extends only in the +direction of (ux,uy); if the commanded
-        velocity is negative along body x, (ux,uy) already points backwards in map.
+        Piecewise-linear speed scaling:
+            d <= stop_distance      -> 0
+            d >= slow_distance      -> 1
+            otherwise               -> (d - stop) / (slow - stop)
         """
-        grid = self.latest_costmap
-        res = grid.info.resolution
-        origin_x = grid.info.origin.position.x
-        origin_y = grid.info.origin.position.y
-        width = grid.info.width
-        height = grid.info.height
-        data = grid.data  # flat row-major
-
-        def world_to_idx(wx, wy):
-            mx = int((wx - origin_x) / res)
-            my = int((wy - origin_y) / res)
-            if mx < 0 or my < 0 or mx >= width or my >= height:
-                return None
-            return my * width + mx
-
-        min_clear = None
-        left_hits = right_hits = 0
-        left_total = right_total = 0
-
-        lateral_samples = max(1, int(self.corridor_width / max(res, 1e-3)))
-        for i in range(-lateral_samples, lateral_samples + 1):
-            offset = (i / max(1, lateral_samples)) * self.corridor_width
-            band = 'left' if offset > 0 else ('right' if offset < 0 else 'center')
-
-            dist = 0.0
-            step = max(self.sampling_step, res)
-            while dist <= self.lookahead:
-                wx = rx + ux * dist + lx * offset
-                wy = ry + uy * dist + ly * offset
-                idx = world_to_idx(wx, wy)
-                if idx is None:
-                    break
-                occ = data[idx]
-                if occ >= self.occupied_threshold:
-                    if (min_clear is None) or (dist < min_clear):
-                        min_clear = dist
-                    if band == 'left':
-                        left_hits += 1
-                    elif band == 'right':
-                        right_hits += 1
-                    break  # blocked along this ray
-
-                if band == 'left':
-                    left_total += 1
-                elif band == 'right':
-                    right_total += 1
-
-                dist += step
-
-        left_density = (left_hits / left_total) if left_total > 0 else None
-        right_density = (right_hits / right_total) if right_total > 0 else None
-        return min_clear, left_density, right_density
+        if d <= self.stop_distance:
+            return 0.0
+        if d >= self.slow_distance:
+            return 1.0
+        # Avoid division by zero if params misconfigured
+        denom = max(self.slow_distance - self.stop_distance, 1e-6)
+        return max(0.0, min(1.0, (d - self.stop_distance) / denom))
 
 
 def main(args=None):
     rclpy.init(args=args)
-    node = CollisionAvoid()
+    node = CmdVelSafety()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
-    node.destroy_node()
-    rclpy.shutdown()
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':
