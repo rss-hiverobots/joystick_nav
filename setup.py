@@ -27,6 +27,7 @@ setup(
             'costmap_joystick = joystick_nav.costmap_joystick:main',
             'room_navigator = joystick_nav.room_navigator:main',
             'exploration = joystick_nav.exploration:main',
+            'move_boxes = joystick_nav.move_boxes:main',
         ],
     },
 )
