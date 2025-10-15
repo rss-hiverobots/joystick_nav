@@ -1,236 +1,143 @@
 #!/usr/bin/env python3
-# g1_manipulation/mission_orchestrator_node.py
-
-from __future__ import annotations
-
-import math
 import time
-from threading import Event
-
 import rclpy
 from rclpy.node import Node
-from rclpy.duration import Duration
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-
-from geometry_msgs.msg import PoseStamped, Quaternion, Twist
+from rclpy.action import ActionClient
+from nav2_msgs.action import NavigateToPose
 from std_msgs.msg import Bool
+from geometry_msgs.msg import Twist
 
+POINT_A = {"x": -6.651529312133789, "y": -17.346385955810547, "oz": -0.8349573785198705, "ow": 0.5503146155202728}
+POINT_B = {
+    "x": -1.714616298675537,
+    "y": -18.474031448364258,
+    "oz": 0.527993528947017,
+    "ow": 0.8492483932219569,
+}
 
-def yaw_to_quat(yaw: float) -> Quaternion:
-    # z-yaw only
-    half = yaw * 0.5
-    q = Quaternion()
-    q.w = math.cos(half)
-    q.x = 0.0
-    q.y = 0.0
-    q.z = math.sin(half)
-    return q
-
-
-class MissionOrchestrator(Node):
-    """
-    Sequence:
-      1) Nav to A -> wait /goal_reached
-      2) /rest True, wait 3.0 s
-      3) drive +0.75 m forward on /grasp/cmd_vel, wait 5.0 s
-      4) /grasp True, wait 15.0 s
-      5) drive -0.75 m back, wait 5.0 s
-      6) Nav to B -> wait /goal_reached
-      7) drive +0.75 m forward, wait 5.0 s
-      8) /drop True, wait 15.0 s
-      9) drive -0.75 m back, wait 5.0 s
-    """
-
+class GoToPose(Node):
     def __init__(self):
-        super().__init__('mission_orchestrator')
+        super().__init__('go_to_pose')
+        self.client     = ActionClient(self, NavigateToPose, 'navigate_to_pose')
+        self.rest_pub   = self.create_publisher(Bool, '/rest', 10)
+        self.cmd_pub    = self.create_publisher(Twist, '/grasp/cmd_vel', 10)
+        self.grasp_pub  = self.create_publisher(Bool, '/grasp', 10)
+        self.drop_pub   = self.create_publisher(Bool, '/drop', 10)
 
-        qos_latched = QoSProfile(
-            reliability=ReliabilityPolicy.RELIABLE,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=1,
-        )
+        print("⏳ Waiting for Nav2 action server...")
+        self.client.wait_for_server()
+        print("✅ Nav2 server available.")
 
-        # --- Parameters (override via YAML or CLI) ---
-        self.declare_parameter('frame_id', 'map')
-        self.declare_parameter('point_a_xytheta', [1.0, 0.0, 0.0])  # [x,y,theta(rad)]
-        self.declare_parameter('point_b_xytheta', [2.5, 0.0, 3.14159])
+        input("🔸 Press [Enter] to send Point A...")
+        self._send_nav_goal(POINT_A, tag="Point A", done_cb=self._after_point_a)
 
-        self.declare_parameter('forward_distance_m', 0.75)
-        self.declare_parameter('backward_distance_m', 0.75)
-        self.declare_parameter('cmd_linear_speed_mps', 0.15)
+    # ---------- helpers ----------
+    def _send_nav_goal(self, pose_dict, tag, done_cb):
+        goal = NavigateToPose.Goal()
+        goal.pose.header.frame_id = 'map'
+        goal.pose.header.stamp = self.get_clock().now().to_msg()
+        goal.pose.pose.position.x = float(pose_dict["x"])
+        goal.pose.pose.position.y = float(pose_dict["y"])
+        goal.pose.pose.orientation.x = 0.0
+        goal.pose.pose.orientation.y = 0.0
+        goal.pose.pose.orientation.z = float(pose_dict["oz"])
+        goal.pose.pose.orientation.w = float(pose_dict["ow"])
 
-        self.declare_parameter('rest_wait_s', 3.0)
-        self.declare_parameter('drive_wait_s', 5.0)
-        self.declare_parameter('grasp_wait_s', 15.0)
-        self.declare_parameter('drop_wait_s', 15.0)
+        print(f"🧭 Sending {tag}...")
+        send_future = self.client.send_goal_async(goal)
 
-        # --- Publishers ---
-        self.goal_pub = self.create_publisher(PoseStamped, '/goal_pose', 10)
-        self.rest_pub = self.create_publisher(Bool, '/rest', qos_latched)
-        self.grasp_pub = self.create_publisher(Bool, '/grasp', qos_latched)
-        self.drop_pub = self.create_publisher(Bool, '/drop', qos_latched)
-        self.cmd_pub = self.create_publisher(Twist, '/grasp/cmd_vel', 10)
+        def _on_goal_response(fut):
+            try:
+                goal_handle = fut.result()
+            except Exception as e:
+                print(f"❌ {tag} send failed: {e}")
+                return
+            if not goal_handle.accepted:
+                print(f"❌ {tag} was REJECTED by server.")
+                return
+            print(f"✅ {tag} accepted; navigating...")
+            goal_handle.get_result_async().add_done_callback(lambda r: done_cb(tag, r))
 
-        # --- Subscribers ---
-        self.goal_reached_evt = Event()
-        self.goal_reached_sub = self.create_subscription(
-            Bool, '/goal_reached', self._on_goal_reached, 10
-        )
+        send_future.add_done_callback(_on_goal_response)
 
-        # Kick off main flow once everything is ready
-        self.create_timer(0.3, self._start_once)
+    def _wait_for_subscribers(self, pub, name, timeout=5.0):
+        t0 = time.time()
+        while pub.get_subscription_count() == 0 and (time.time() - t0) < timeout:
+            print(f"⏳ Waiting for a subscriber on {name}...")
+            time.sleep(0.1)
+        print(f"🔌 {name} subscriber count = {pub.get_subscription_count()}")
+        return pub.get_subscription_count() > 0
 
-        self._started = False
-
-    # -------------------- Callbacks --------------------
-
-    def _on_goal_reached(self, msg: Bool):
-        if msg.data:
-            self.get_logger().info('✅ Received /goal_reached True')
-            self.goal_reached_evt.set()
-
-    # -------------------- Helpers ---------------------
-
-    def _start_once(self):
-        if self._started:
+    def _drive_for(self, vx, duration_s):
+        if not self._wait_for_subscribers(self.cmd_pub, "/grasp/cmd_vel", timeout=5.0):
+            print("⚠️ No subscribers on /grasp/cmd_vel. Skipping motion.")
             return
-        self._started = True
-        self.get_logger().info('🚀 Mission orchestrator starting sequence...')
-        try:
-            self._run_sequence()
-            self.get_logger().info('🎯 Mission complete.')
-        except Exception as e:
-            self.get_logger().error(f'Mission aborted with error: {e}')
-
-    def _publish_bool(self, pub, name: str):
-        pub.publish(Bool(data=True))
-        self.get_logger().info(f'→ Sent {name}=True')
-
-    def _send_goal(self, x: float, y: float, yaw: float, frame_id: str):
-        msg = PoseStamped()
-        msg.header.frame_id = frame_id
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.pose.position.x = float(x)
-        msg.pose.position.y = float(y)
-        msg.pose.position.z = 0.0
-        msg.pose.orientation = yaw_to_quat(yaw)
-        self.goal_reached_evt.clear()
-        self.goal_pub.publish(msg)
-        self.get_logger().info(
-            f'→ Sent /goal_pose: frame={frame_id} pos=({x:.3f},{y:.3f}) yaw={yaw:.3f} rad'
-        )
-
-    def _wait_goal(self, timeout_s: float | None = None):
-        self.get_logger().info('… waiting for /goal_reached True')
-        ok = self.goal_reached_evt.wait(timeout=timeout_s)
-        if not ok:
-            raise TimeoutError('Timed out waiting for /goal_reached')
-        # small debounce
-        rclpy.sleep(Duration(seconds=0.2))
-        self.goal_reached_evt.clear()
-
-    def _drive_distance(self, distance_m: float, speed_mps: float):
-        """
-        Publish Twist at constant speed for the computed duration, then stop.
-        Positive distance -> forward (+x); negative -> reverse.
-        """
-        speed = abs(speed_mps)
-        direction = 1.0 if distance_m >= 0.0 else -1.0
-        duration = abs(distance_m) / (speed if speed > 1e-6 else 1e-6)
-
+        self.cmd_pub.publish(Twist())  # wake
+        time.sleep(0.05)
         twist = Twist()
-        twist.linear.x = direction * speed
-        twist.linear.y = 0.0
-        twist.linear.z = 0.0
-        twist.angular.z = 0.0
-
-        self.get_logger().info(
-            f'→ Driving {"forward" if direction>0 else "backward"}: '
-            f'{abs(distance_m):.2f} m @ {speed:.2f} m/s (~{duration:.1f} s)'
-        )
-
-        start = self.get_clock().now()
-        rate = self.create_rate(20.0, self.get_clock())  # 20 Hz
-        while (self.get_clock().now() - start) < Duration(seconds=duration):
+        twist.linear.x = float(vx)
+        t0 = time.time()
+        while time.time() - t0 < duration_s and rclpy.ok():
             self.cmd_pub.publish(twist)
-            rate.sleep()
-
-        # Stop
+            time.sleep(0.1)
         self.cmd_pub.publish(Twist())
-        self.get_logger().info('→ Drive stop (zero Twist published)')
 
-    # -------------------- Main Sequence ---------------------
+    # ---------- sequence ----------
+    def _after_point_a(self, tag, result_fut):
+        result = result_fut.result()
+        print(f"📬 {tag} result received (status={getattr(result, 'status', 'unknown')}).")
 
-    def _run_sequence(self):
-        frame_id = self.get_parameter('frame_id').get_parameter_value().string_value
+        print("📢 Publishing /rest: True")
+        self.rest_pub.publish(Bool(data=True))
 
-        ax, ay, atheta = self.get_parameter('point_a_xytheta').get_parameter_value().double_array_value
-        bx, by, btheta = self.get_parameter('point_b_xytheta').get_parameter_value().double_array_value
+        input("🔸 Press [Enter] to move forward...")
+        print("➡️  Forward 2.2s @ 0.2 m/s")
+        self._drive_for(+0.2, 2.2)
+        print("🛑 Forward movement complete")
 
-        fwd = float(self.get_parameter('forward_distance_m').value)
-        back = float(self.get_parameter('backward_distance_m').value)
-        v = float(self.get_parameter('cmd_linear_speed_mps').value)
+        input("🔸 Press [Enter] to GRASP...")
+        self.grasp_pub.publish(Bool(data=True))
+        print("🤝 Published /grasp: True")
 
-        rest_wait = float(self.get_parameter('rest_wait_s').value)
-        drive_wait = float(self.get_parameter('drive_wait_s').value)
-        grasp_wait = float(self.get_parameter('grasp_wait_s').value)
-        drop_wait = float(self.get_parameter('drop_wait_s').value)
+        input("🔸 Press [Enter] to move backward...")
+        print("⬅️  Backward 2.5s @ 0.2 m/s")
+        self._drive_for(-0.2, 2.5)
+        print("🛑 Backward movement complete")
 
-        # ---------- To A ----------
-        self._send_goal(ax, ay, atheta, frame_id)
-        self._wait_goal()
+        print("🧭 Navigating to Point B...")
+        self._send_nav_goal(POINT_B, tag="Point B", done_cb=self._after_point_b)
 
-        # ---------- Rest ----------
-        self._publish_bool(self.rest_pub, '/rest')
-        self.get_logger().info(f'… waiting {rest_wait:.1f}s after /rest')
-        time.sleep(rest_wait)
+    def _after_point_b(self, tag, result_fut):
+        result = result_fut.result()
+        print(f"📬 {tag} result received (status={getattr(result, 'status', 'unknown')}).")
 
-        # ---------- Approach table at A ----------
-        self._drive_distance(+fwd, v)
-        self.get_logger().info(f'… waiting {drive_wait:.1f}s after forward drive')
-        time.sleep(drive_wait)
+        # Move forward 2.5s
+        print("➡️  Forward 2.5s @ 0.2 m/s")
+        self._drive_for(+0.2, 2.5)
+        print("🛑 Forward movement complete")
 
-        # ---------- Grasp ----------
-        self._publish_bool(self.grasp_pub, '/grasp')
-        self.get_logger().info(f'… waiting {grasp_wait:.1f}s for grasping motion')
-        time.sleep(grasp_wait)
+        # Wait for Enter, then drop
+        input("🔸 Press [Enter] to DROP (publish /drop True once)... ")
+        self.drop_pub.publish(Bool(data=True))
+        print("📦 Published /drop: True")
 
-        # ---------- Back away ----------
-        self._drive_distance(-back, v)
-        self.get_logger().info(f'… waiting {drive_wait:.1f}s after backward drive')
-        time.sleep(drive_wait)
+        # Wait for Enter, then back 2.2s and /rest
+        input("🔸 Press [Enter] to move backward and REST... ")
+        print("⬅️  Backward 2.2s @ 0.2 m/s")
+        self._drive_for(-0.2, 2.2)
+        print("🛑 Backward movement complete")
 
-        # ---------- To B ----------
-        self._send_goal(bx, by, btheta, frame_id)
-        self._wait_goal()
+        print("😌 Publishing /rest: True")
+        self.rest_pub.publish(Bool(data=True))
 
-        # ---------- Approach table at B ----------
-        self._drive_distance(+fwd, v)
-        self.get_logger().info(f'… waiting {drive_wait:.1f}s after forward drive')
-        time.sleep(drive_wait)
-
-        # ---------- Drop ----------
-        self._publish_bool(self.drop_pub, '/drop')
-        self.get_logger().info(f'… waiting {drop_wait:.1f}s for drop motion')
-        time.sleep(drop_wait)
-
-        # ---------- Back away ----------
-        self._drive_distance(-back, v)
-        self.get_logger().info(f'… waiting {drive_wait:.1f}s after backward drive')
-        time.sleep(drive_wait)
-
+        print("✅ Sequence complete. Shutting down.")
+        rclpy.shutdown()
 
 def main():
     rclpy.init()
-    node = MissionOrchestrator()
-    try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        node.destroy_node()
-        rclpy.shutdown()
+    node = GoToPose()
+    rclpy.spin(node)
+    node.destroy_node()
 
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
