@@ -7,12 +7,20 @@ from nav2_msgs.action import NavigateToPose
 from std_msgs.msg import Bool
 from geometry_msgs.msg import Twist
 
-POINT_A = {"x": -6.651529312133789, "y": -17.346385955810547, "oz": -0.8349573785198705, "ow": 0.5503146155202728}
+# POINT_A = {"x": -6.651529312133789, "y": -17.346385955810547, "oz": -0.8349573785198705, "ow": 0.5503146155202728}
+# POINT_B = {
+#     "x": -1.714616298675537,
+#     "y": -18.474031448364258,
+#     "oz": 0.527993528947017,
+#     "ow": 0.8492483932219569,
+# }
+
+POINT_A = {"x": -3.9384405612945557, "y": -10.634344100952148, "oz": -0.8365689400213355, "ow": 0.5478616692118359}
 POINT_B = {
-    "x": -1.714616298675537,
-    "y": -18.474031448364258,
-    "oz": 0.527993528947017,
-    "ow": 0.8492483932219569,
+    "x": -0.7935936450958252,
+    "y": -4.847171783447266,
+    "oz": -0.19851819594062212,
+    "ow": 0.9800972022613271,
 }
 
 class GoToPose(Node):
@@ -92,7 +100,7 @@ class GoToPose(Node):
 
         input("🔸 Press [Enter] to move forward...")
         print("➡️  Forward 2.2s @ 0.2 m/s")
-        self._drive_for(+0.2, 2.2)
+        self._drive_for(+0.2, 2.5)
         print("🛑 Forward movement complete")
 
         input("🔸 Press [Enter] to GRASP...")
