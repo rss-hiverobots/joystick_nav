@@ -15,7 +15,7 @@ from geometry_msgs.msg import Twist
 #     "ow": 0.8492483932219569,
 # }
 
-POINT_A = {"x": -3.9384405612945557, "y": -10.634344100952148, "oz": -0.8365689400213355, "ow": 0.5478616692118359}
+POINT_A = {"x": -4.093898296356201, "y": -10.793622970581055, "oz": -0.7973068595125722, "ow": 0.6035741642699756}
 POINT_B = {
     "x": -0.7935936450958252,
     "y": -4.847171783447266,
@@ -31,12 +31,12 @@ class GoToPose(Node):
         self.cmd_pub    = self.create_publisher(Twist, '/grasp/cmd_vel', 10)
         self.grasp_pub  = self.create_publisher(Bool, '/grasp', 10)
         self.drop_pub   = self.create_publisher(Bool, '/drop', 10)
+        self.approach_pub = self.create_publisher(Bool, '/approach', 10)
 
         print("⏳ Waiting for Nav2 action server...")
         self.client.wait_for_server()
         print("✅ Nav2 server available.")
-
-        input("🔸 Press [Enter] to send Point A...")
+        
         self._send_nav_goal(POINT_A, tag="Point A", done_cb=self._after_point_a)
 
     # ---------- helpers ----------
@@ -97,15 +97,19 @@ class GoToPose(Node):
 
         print("📢 Publishing /rest: True")
         self.rest_pub.publish(Bool(data=True))
+        time.sleep(3.0)
 
-        input("🔸 Press [Enter] to move forward...")
         print("➡️  Forward 2.2s @ 0.2 m/s")
-        self._drive_for(+0.2, 2.5)
+        self._drive_for(+0.2, 2.0)
         print("🛑 Forward movement complete")
 
-        input("🔸 Press [Enter] to GRASP...")
-        self.grasp_pub.publish(Bool(data=True))
-        print("🤝 Published /grasp: True")
+        self._wait_for_subscribers(self.approach_pub, "/approach", timeout=5.0)
+        self.approach_pub.publish(Bool(data=True))
+        print("🚶 Published /approach: True")
+
+        # input("🔸 Press [Enter] to GRASP...")
+        # self.grasp_pub.publish(Bool(data=True))
+        # print("🤝 Published /grasp: True")
 
         input("🔸 Press [Enter] to move backward...")
         print("⬅️  Backward 2.5s @ 0.2 m/s")
@@ -125,7 +129,6 @@ class GoToPose(Node):
         print("🛑 Forward movement complete")
 
         # Wait for Enter, then drop
-        input("🔸 Press [Enter] to DROP (publish /drop True once)... ")
         self.drop_pub.publish(Bool(data=True))
         print("📦 Published /drop: True")
 
