@@ -107,11 +107,7 @@ class GoToPose(Node):
         self.approach_pub.publish(Bool(data=True))
         print("🚶 Published /approach: True")
 
-        # input("🔸 Press [Enter] to GRASP...")
-        # self.grasp_pub.publish(Bool(data=True))
-        # print("🤝 Published /grasp: True")
-
-        input("🔸 Press [Enter] to move backward...")
+        time.sleep(60.0)
         print("⬅️  Backward 2.5s @ 0.2 m/s")
         self._drive_for(-0.2, 2.5)
         print("🛑 Backward movement complete")
@@ -125,7 +121,7 @@ class GoToPose(Node):
 
         # Move forward 2.5s
         print("➡️  Forward 2.5s @ 0.2 m/s")
-        self._drive_for(+0.2, 2.5)
+        self._drive_for(+0.2, 2.0)
         print("🛑 Forward movement complete")
 
         # Wait for Enter, then drop
@@ -133,13 +129,14 @@ class GoToPose(Node):
         print("📦 Published /drop: True")
 
         # Wait for Enter, then back 2.2s and /rest
-        input("🔸 Press [Enter] to move backward and REST... ")
-        print("⬅️  Backward 2.2s @ 0.2 m/s")
-        self._drive_for(-0.2, 2.2)
-        print("🛑 Backward movement complete")
+        time.sleep(17.0)
 
         print("😌 Publishing /rest: True")
         self.rest_pub.publish(Bool(data=True))
+        
+        print("⬅️  Backward 2.2s @ 0.2 m/s")
+        self._drive_for(-0.2, 2.2)
+        print("🛑 Backward movement complete")
 
         print("✅ Sequence complete. Shutting down.")
         rclpy.shutdown()
