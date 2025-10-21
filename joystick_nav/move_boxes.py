@@ -158,7 +158,7 @@ class GoToPose(Node):
         threading.Thread(target=self._continue_after_approach, daemon=True).start()
 
     def _continue_after_approach(self):
-        self._wait_for_mc('approach', timeout_s=60.0)
+        self._wait_for_mc('approach', timeout_s=120.0)
 
         print("⬅️  Backward 2.5s @ 0.2 m/s")
         self._drive_for(-0.2, 2.5)
