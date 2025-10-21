@@ -161,7 +161,7 @@ class GoToPose(Node):
         self._wait_for_mc('approach', timeout_s=120.0)
 
         print("⬅️  Backward 2.5s @ 0.2 m/s")
-        self._drive_for(-0.2, 2.5)
+        self._drive_for(-0.2, 3.5)
         print("🛑 Backward movement complete")
 
         print("🧭 Navigating to Point B...")
